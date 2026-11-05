@@ -803,6 +803,20 @@ def parse_markdown(path: Path) -> list[dict]:
 # Диспетчер форматов
 # ----------------------------------------------------------------------------
 
+def _is_deepseek_mapping(mapping) -> bool:
+    """DeepSeek: mapping[i].message.fragments[] (REQUEST/RESPONSE/...).
+       ChatGPT: mapping[i].message.author.role + message.content.parts[]."""
+    if not isinstance(mapping, dict):
+        return False
+    for node in mapping.values():
+        if not isinstance(node, dict):
+            continue
+        msg = node.get("message")
+        if isinstance(msg, dict) and isinstance(msg.get("fragments"), list):
+            return True
+    return False
+
+
 def detect_format(path: Path, data) -> str:
     suf = path.suffix.lower()
     if suf == ".jsonl":
@@ -818,13 +832,14 @@ def detect_format(path: Path, data) -> str:
     if not isinstance(first, dict):
         return "unknown"
     if "mapping" in first:
+        if _is_deepseek_mapping(first.get("mapping") or {}):
+            return "deepseek_json"
         return "chatgpt_legacy"
     if "versions" in first or ("messages" in first and "lastUsedModel" in first):
         return "lmstudio_json"
     if "schemaVersion" in first and "source" in first and "messages" in first:
         return "chatgpt_export_v1"
     return "unknown"
-
 
 # ----------------------------------------------------------------------------
 # Writer (та же схема, что у модуля; модуль не меняем)
@@ -948,7 +963,10 @@ def _do_import_file(path, chats_dir, backup_dir, attachments_dir,
                     result["errors"].append(f"Invalid JSON: {e}")
                     return result
                 fmt = detect_format(path, raw)
-                if fmt == "lmstudio_json":
+                if fmt == "deepseek_json":
+                    chats = IM.parse_deepseek(raw if isinstance(raw, list) else [raw])
+                    source, fmt = "deepseek", "deepseek_json"
+                elif fmt == "lmstudio_json":
                     chats, source = parse_lmstudio(raw), "lmstudio"
                 elif fmt == "chatgpt_legacy":
                     chats = IM.parse_chatgpt(raw if isinstance(raw, list) else [raw])
@@ -973,7 +991,13 @@ def _do_import_file(path, chats_dir, backup_dir, attachments_dir,
                     result["failed"] = 1
                     result["errors"].append(f"Invalid JSON: {e}")
                     return result
-                if fmt_override == "lmstudio":
+                if fmt_override == "deepseek":
+                    chats, source, fmt = (
+                        IM.parse_deepseek(raw if isinstance(raw, list) else [raw]),
+                        "deepseek",
+                        "deepseek_json",
+                    )
+                elif fmt_override == "lmstudio":
                     chats, source, fmt = parse_lmstudio(raw), "lmstudio", "lmstudio_json"
                 else:
                     if isinstance(raw, dict) and "schemaVersion" in raw:
@@ -1072,12 +1096,12 @@ def main():
                     help="Файл чата (.json/.jsonl/.md) или пусто при --import-dir")
     ap.add_argument("--import-dir", type=Path, default=None,
                     help="Импортировать все *.json/*.jsonl/*.md из папки")
-    ap.add_argument("--format", choices=["auto", "llamacpp", "lmstudio",
-                                         "chatgpt", "markdown"], default="auto")
     ap.add_argument("--all", action="store_true",
                     help="Импортировать все чаты из массива")
     ap.add_argument("--force", action="store_true",
                     help="Перезаписать всё: игнорировать skipped_dup и локальные правки")
+    ap.add_argument("--format", choices=["auto", "llamacpp", "lmstudio", "chatgpt", "deepseek", "markdown"],
+                    default="auto")                
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--chats-dir", type=Path, default=here / "chats")
     ap.add_argument("--backup-dir", type=Path, default=here / "backup")

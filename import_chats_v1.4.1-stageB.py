@@ -442,17 +442,23 @@ def parse_deepseek(data: list[dict]) -> list[dict]:
                             "status":    "missing",
                         })
 
-                if not found_request and not found_response:
-                    if images or files:
-                        print(
-                            f"[WARN] DeepSeek {original_id}: сообщение с вложениями "
-                            f"без REQUEST/RESPONSE пропущено (роль не определена)",
-                            file=sys.stderr,
-                        )
-                    continue
-                role = "user" if found_request else "assistant"
-                if role not in ("user", "assistant"):
-                    continue
+                if found_request:
+                    role = "user"
+                elif found_response:
+                    role = "assistant"
+                else:
+                    # DeepSeek не пишет role в message; роль выводится из
+                    # фрагментов. Узел без REQUEST/RESPONSE, но с файлами/
+                    # картинками — это "attachment-only" ход пользователя
+                    # (юзер прислал файл/скрин без текста). В DeepSeek
+                    # ассистент вложений не отправляет, поэтому fallback="user".
+                    explicit_role = msg.get("role")
+                    if explicit_role in ("user", "assistant"):
+                        role = explicit_role
+                    elif images or files:
+                        role = "user"
+                    else:
+                        continue  # пустой узел без вложений — пропускаем
 
                 chat_raw_images += len(images)
                 chat_raw_files += len(files)

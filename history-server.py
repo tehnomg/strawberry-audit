@@ -1562,7 +1562,10 @@ def _process_import_file(content: bytes, filename: str):
             fmt = IMPORT_MOD.detect_format(tmp, raw)
             print(f"[IMPORT] Detected format: {fmt}")
             
-            if fmt == "lmstudio_json":
+            if fmt == "deepseek_json":
+                chats = IMPORT_MOD.IM.parse_deepseek(raw if isinstance(raw, list) else [raw])
+                source = "deepseek"
+            elif fmt == "lmstudio_json":
                 chats = IMPORT_MOD.parse_lmstudio(raw)
                 source = "lmstudio"
             elif fmt == "chatgpt_legacy":
