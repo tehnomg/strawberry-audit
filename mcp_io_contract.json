@@ -1,0 +1,74 @@
+﻿{
+    "jsonrpc":  "2.0",
+    "id":  2,
+    "result":  {
+                   "content":  [
+                                   {
+                                       "type":  "text",
+                                       "text":  "{\n  \"status\": \"schema\",\n  \"action\": {\n    \"name\": \"list\",\n    \"description\": \"Navigate one authorized directory or list accessible roots. For a named subfolder, try its path directly, e.g. path=\\\"@outputs/selection\\\"; no need to enumerate its parent. Use rg for recursive search; detailed metadata is available through info.\",\n    \"parameters\": {\n      \"type\": \"object\",\n      \"properties\": {\n        \"path\": {\n          \"type\": \"string\",\n          \"default\": \"\"\n        },\n        \"pattern\": {\n          \"type\": \"string\",\n          \"default\": \"*\"\n        },\n        \"media_type\": {\n          \"type\": \"string\",\n          \"enum\": [\n            \"all\",\n            \"image\",\n            \"video\",\n            \"audio\",\n            \"3d\",\n            \"world\",\n            \"txt\",\n            \"other\"\n          ],\n          \"default\": \"all\"\n        },\n        \"recursive\": {\n          \"type\": \"boolean\",\n          \"default\": false,\n          \"description\": \"Also list the files of every subfolder (files only, any depth; pattern matches file names, any case).\"\n        },\n        \"limit\": {\n          \"type\": \"integer\",\n          \"minimum\": 1,\n          \"maximum\": 100,\n          \"default\": 20\n        },\n        \"cursor\": {\n          \"type\": [\n            \"string\",\n            \"null\"\n          ],\n          \"default\": null\n        },\n        \"summary_only\": {\n          \"type\": \"boolean\",\n          \"default\": false\n        }\n      },\n      \"required\": [],\n      \"additionalProperties\": false\n    },\n    \"limitations\": \"Pages have count/volume limits. Continue with unchanged filters and cursor=next_cursor; cursors expire after 10 minutes or eviction. summary_only returns the stored count without items.\"\n  }\n}"
+                                   }
+                               ],
+                   "structuredContent":  {
+                                             "status":  "schema",
+                                             "action":  {
+                                                            "name":  "list",
+                                                            "description":  "Navigate one authorized directory or list accessible roots. For a named subfolder, try its path directly, e.g. path=\"@outputs/selection\"; no need to enumerate its parent. Use rg for recursive search; detailed metadata is available through info.",
+                                                            "parameters":  {
+                                                                               "type":  "object",
+                                                                               "properties":  {
+                                                                                                  "path":  {
+                                                                                                               "type":  "string",
+                                                                                                               "default":  ""
+                                                                                                           },
+                                                                                                  "pattern":  {
+                                                                                                                  "type":  "string",
+                                                                                                                  "default":  "*"
+                                                                                                              },
+                                                                                                  "media_type":  {
+                                                                                                                     "type":  "string",
+                                                                                                                     "enum":  [
+                                                                                                                                  "all",
+                                                                                                                                  "image",
+                                                                                                                                  "video",
+                                                                                                                                  "audio",
+                                                                                                                                  "3d",
+                                                                                                                                  "world",
+                                                                                                                                  "txt",
+                                                                                                                                  "other"
+                                                                                                                              ],
+                                                                                                                     "default":  "all"
+                                                                                                                 },
+                                                                                                  "recursive":  {
+                                                                                                                    "type":  "boolean",
+                                                                                                                    "default":  false,
+                                                                                                                    "description":  "Also list the files of every subfolder (files only, any depth; pattern matches file names, any case)."
+                                                                                                                },
+                                                                                                  "limit":  {
+                                                                                                                "type":  "integer",
+                                                                                                                "minimum":  1,
+                                                                                                                "maximum":  100,
+                                                                                                                "default":  20
+                                                                                                            },
+                                                                                                  "cursor":  {
+                                                                                                                 "type":  [
+                                                                                                                              "string",
+                                                                                                                              "null"
+                                                                                                                          ],
+                                                                                                                 "default":  null
+                                                                                                             },
+                                                                                                  "summary_only":  {
+                                                                                                                       "type":  "boolean",
+                                                                                                                       "default":  false
+                                                                                                                   }
+                                                                                              },
+                                                                               "required":  [
+
+                                                                                            ],
+                                                                               "additionalProperties":  false
+                                                                           },
+                                                            "limitations":  "Pages have count/volume limits. Continue with unchanged filters and cursor=next_cursor; cursors expire after 10 minutes or eviction. summary_only returns the stored count without items."
+                                                        }
+                                         },
+                   "isError":  false
+               }
+}
