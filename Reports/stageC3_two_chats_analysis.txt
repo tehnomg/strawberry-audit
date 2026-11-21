@@ -1,0 +1,137 @@
+фикстура: C:\Users\User\Documents\Strata\Workspace\StrawberryEdition\experiments\stageC_fixtures\zip_packages\pkg_two_chats.zip
+размер архива: 2531 байт
+
+1. содержимое архива (путь, размер, sha256)
+-------------------------------------------
+chat.json                                          1420 fd18ef4fa12ee6ac8300456eb274a9ca2e85057798ac798f2649725bef954885
+attachments/file-A1.dat                            2070 2383be5b10a2f2a15b2a6622d968175bd10ff4a18872254513d52182b95c5026
+attachments/file-A2.dat                              49 4c7fff5e4fe23c0a8c9221920ca885e340694b5425f92b4e84366395717641c2
+attachments/file-A1.dat.meta.json                    57 2f9610d86988fc3ab060d6b71082ca56336f25f945e0eddfeccd34087c45683b
+attachments/conversation_asset_file_names.json       66 883c13d1f34e331e831f7a96d3897db9645645872810b033c5926b11feb84031
+manifest.json                                       516 b284c2f5b36a4332d1af35b2b034e1c7308cedb6ceb75cba5b8fbc45a6b899ee
+chat2.json                                         1420 7667a54da2537d20f49d56274553985075f39bab80d2a72a9de940cd2403f14f
+
+2. чаты внутри пакета
+---------------------
+chat.json: format='strawberry.v1' conversationId='c0conv-0001' title='Пакет C0' source.url='https://chatgpt.com/c/c0conv-0001'
+    сообщений 2, assetId в репликах: ['file-A1', 'file-A2']
+    реплики: [('user', 'вопрос пакета'), ('assistant', '')]
+chat2.json: format='strawberry.v1' conversationId='c0conv-0002' title='Пакет C0' source.url='https://chatgpt.com/c/c0conv-0002'
+    сообщений 2, assetId в репликах: ['file-A1', 'file-A2']
+    реплики: [('user', 'вопрос пакета'), ('assistant', '')]
+
+3. manifest.json пакета
+-----------------------
+   манифест:
+   {"schemaVersion": 1, "profile": "strawberry", "profileVersion": "1.1", "title": "Пакет C0", "sourceUrl": "https://chatgpt.com/c/c0conv-0001", "files": [{"name": "attachments/file-A1.dat", "size": 2070, "sha256": "2383be5b10a2f2a15b2a6622d968175bd10ff4a18872254513d52182b95c5026"}, {"name": "attachments/file-A2.dat", "size": 49, "sha256": "4c7fff5e4fe23c0a8c9221920ca885e340694b5425f92b4e84366395717641c2"}], "format": "strawberry.v1", "conversationId": "c0conv-0001"}
+   conversationId манифеста: 'c0conv-0001'
+   файлы в манифесте:
+      'attachments/file-A1.dat' size=2070 sha256=2383be5b10a2f2a1...
+      'attachments/file-A2.dat' size=49 sha256=4c7fff5e4fe23c0a...
+   имена вложений (conversation_asset_file_names.json):
+   {"file-A1.dat": "отчёт.pdf", "file-A2.dat": "рис.png"}
+
+4. привязка attachmentId -> .dat -> манифест (для каждого чата)
+---------------------------------------------------------------
+   chat.json реплика #0 assetId=file-A1
+      .dat в архиве: True, строка манифеста: True
+      реальный размер 2070, реальный sha 2383be5b10a2f2a1
+      манифест: размер 2070 sha 2383be5b10a2f2a1 совпадение размера True sha True
+      заявка реплики: size=2067 sha=None
+   chat.json реплика #1 assetId=file-A2
+      .dat в архиве: True, строка манифеста: True
+      реальный размер 49, реальный sha 4c7fff5e4fe23c0a
+      манифест: размер 49 sha 4c7fff5e4fe23c0a совпадение размера True sha True
+      заявка реплики: size=45 sha=None
+   chat2.json реплика #0 assetId=file-A1
+      .dat в архиве: True, строка манифеста: True
+      реальный размер 2070, реальный sha 2383be5b10a2f2a1
+      манифест: размер 2070 sha 2383be5b10a2f2a1 совпадение размера True sha True
+      заявка реплики: size=2067 sha=None
+   chat2.json реплика #1 assetId=file-A2
+      .dat в архиве: True, строка манифеста: True
+      реальный размер 49, реальный sha 4c7fff5e4fe23c0a
+      манифест: размер 49 sha 4c7fff5e4fe23c0a совпадение размера True sha True
+      заявка реплики: size=45 sha=None
+
+5. фактический прогон импортёра на этой фикстуре
+------------------------------------------------
+   rc=0
+   счётчики: {"not_a_chat": 3, "NEW": 2}
+   пакеты:   {"package_chats": 2, "records": 4, "verified": 4, "refused": 0, "names_from_manifest": 0}
+   вложения: {"images": 2, "files": 2, "records": 4, "staged": 4, "reused": 0, "remote": 0, "missing": 0, "unique_files": 2, "unsupported": 0, "signature_fixed": 0}
+   файлов чатов 2: ['chatgpt-c0conv-0001.json', 'chatgpt-c0conv-0002.json']
+   вложение: chatgpt-c0conv-0001/2383be5b10a2f2a15b2a6622d968175bd10ff4a18872254513d52182b95c5026.pdf   2070 2383be5b10a2f2a1
+   вложение: chatgpt-c0conv-0001/4c7fff5e4fe23c0a8c9221920ca885e340694b5425f92b4e84366395717641c2.png     49 4c7fff5e4fe23c0a
+   вложение: chatgpt-c0conv-0002/2383be5b10a2f2a15b2a6622d968175bd10ff4a18872254513d52182b95c5026.pdf   2070 2383be5b10a2f2a1
+   вложение: chatgpt-c0conv-0002/4c7fff5e4fe23c0a8c9221920ca885e340694b5425f92b4e84366395717641c2.png     49 4c7fff5e4fe23c0a
+   уникальных sha256 среди записанных файлов: 2; всего байт 4238
+   дублирование байт: 2383be5b10a2f2a1... -> ['chatgpt-c0conv-0001/2383be5b10a2f2a15b2a6622d968175bd10ff4a18872254513d52182b95c5026.pdf', 'chatgpt-c0conv-0002/2383be5b10a2f2a15b2a6622d968175bd10ff4a18872254513d52182b95c5026.pdf']
+   дублирование байт: 4c7fff5e4fe23c0a... -> ['chatgpt-c0conv-0001/4c7fff5e4fe23c0a8c9221920ca885e340694b5425f92b4e84366395717641c2.png', 'chatgpt-c0conv-0002/4c7fff5e4fe23c0a8c9221920ca885e340694b5425f92b4e84366395717641c2.png']
+   запись chatgpt-c0conv-0001.json: id=chatgpt-c0conv-0001 source=chatgpt source_kind=package original_id=c0conv-0001 messages=2
+      вложения записи: [('file-A1', 'available', '2383be5b10a2f2a15b2a6622d968175bd10ff4a18872254513d52182b95c5026'), ('file-A2', 'available', '4c7fff5e4fe23c0a8c9221920ca885e340694b5425f92b4e84366395717641c2')]
+   запись chatgpt-c0conv-0002.json: id=chatgpt-c0conv-0002 source=chatgpt source_kind=package original_id=c0conv-0002 messages=2
+      вложения записи: [('file-A1', 'available', '2383be5b10a2f2a15b2a6622d968175bd10ff4a18872254513d52182b95c5026'), ('file-A2', 'available', '4c7fff5e4fe23c0a8c9221920ca885e340694b5425f92b4e84366395717641c2')]
+   бэкапов: 0
+
+5.1 где именно отражается чужой манифест для второго чата
+---------------------------------------------------------
+   беседа chatgpt-c0conv-0001: action='NEW'
+      report.warnings = []
+      report.package  = {"dir": "C:\\Users\\User\\AppData\\Local\\Temp\\strawberry-import-32576-f74ff0d6\\1", "manifest": true, "manifest_files": 2, "manifest_error": null}
+      report.attachments = {"records": 2, "verified": 2, "refused": 0, "names_from_manifest": 0, "reasons": {}}
+   беседа chatgpt-c0conv-0002: action='NEW'
+      report.warnings = ["manifest.json описывает беседу «c0conv-0001», а не «c0conv-0002»: в пакете больше одной беседы или манифест от другой беседы"]
+      report.package  = {"dir": "C:\\Users\\User\\AppData\\Local\\Temp\\strawberry-import-32576-f74ff0d6\\1", "manifest": true, "manifest_files": 2, "manifest_error": null}
+      report.attachments = {"records": 2, "verified": 2, "refused": 0, "names_from_manifest": 0, "reasons": {}}
+   summary.warnings прогона: []
+   ключи счётчиков прогона: ['NEW', 'not_a_chat']
+   код возврата прогона: 0
+
+6. повторный прогон того же архива в тот же архив данных
+--------------------------------------------------------
+   rc=0 счётчики: {"not_a_chat": 3, "SKIP": 2}
+   чатов до 2 после 2, новые: []
+   вложений до 4 после 4, новые: []
+   бэкапов после второго прогона: 0
+
+7. что дал бы корректный пакет (один чат) — сравнение
+-----------------------------------------------------
+   pkg_ok.zip: rc=0 счётчики: {"not_a_chat": 3, "NEW": 1}
+   pkg_ok.zip: пакеты: {"package_chats": 1, "records": 2, "verified": 2, "refused": 0, "names_from_manifest": 0}
+   pkg_ok.zip: чатов 1, файлов вложений 2, байт в вложениях 2119
+   pkg_two_chats.zip: чатов 2, файлов вложений 4, байт в вложениях 4238
+
+выводы разбора
+--------------
+   1. Контракт пакета (C0): один пакет = одна беседа. `manifest.json` в пакете
+      ровно один, у него один `conversationId` и один список `files[]`. Он
+      описывает беседу `chat.json` и ничего не говорит о `chat2.json`: в пакете
+      нет ни второго манифеста, ни признака принадлежности второй беседы.
+   2. Оба файла чата ссылаются на одни и те же `attachmentId` (file-A1, file-A2).
+      Значит, у второй беседы вложения буквально те же байты, которые манифест
+      привязывает к первой беседе; проверить эту привязку нечем.
+   3. Импортёр принимает оба файла как две самостоятельные беседы (`NEW 2`) и
+      проверяет целостность обеих по одному и тому же манифесту, поэтому все 4
+      записи вложений получают `available`. Проверка размера и SHA256 при этом
+      честная (байты совпадают) — под угрозой не содержимое файла, а принадлежность
+      файла беседе.
+   4. Байты дублируются: 4 записанных файла вместо 2, 4238 байт вместо 2119,
+      два каталога вложений с идентичными sha256. Счётчик пакетов тоже завышен:
+      `package_chats 2`, `records 4`, `verified 4` для пакета, который по контракту
+      даёт 1/2/2.
+   5. Предупреждение о чужом манифесте есть, но только в отчёте конкретной беседы
+      (`chats[].report.warnings`). В `summary.warnings`, в предупреждениях прогона,
+      в отдельном счётчике и в коде возврата (rc=0) этот случай не отражён, то есть
+      при обычном просмотре сводки он незаметен.
+   6. Повторный прогон даёт `SKIP 2` без новых файлов: искажённое состояние
+      закрепляется, и исправить его потом (разделить две беседы, убрать лишние
+      вложения) можно только вручную.
+
+   Предпочтительное поведение (решение не принято, код на этом подэтапе не менялся):
+   пакет с двумя файлами чатов при одном манифесте — нарушение структуры пакета,
+   поэтому отклонять нужно весь пакет целиком и без частичного импорта: ни первой,
+   ни второй беседы, ни вложений, с отдельной причиной (условно
+   `package_multiple_chats`) и своим счётчиком, чтобы случай не маскировался под
+   предупреждение. Молча импортировать одну беседу из двух тоже нельзя: это
+   частичная запись. Обсуждение и реализация — за пределами защитной правки.
