@@ -1,0 +1,171 @@
+{
+  "at": "2026-11-20T19:07:22.177Z",
+  "node": "v24.16.0",
+  "scale": {
+    "repeat": 60,
+    "imagesExpected": 60,
+    "imagesInHtml": 60,
+    "allBytesIdentical": true,
+    "formatMs": 1112,
+    "htmlBytes": 59138069,
+    "rssMB": 468
+  },
+  "originals": {
+    "jpgA": {
+      "file": "chatgpt-6aaa1f50-0e78-83eb-8c01-9153effd07ea/6bf9354b85106302f1e75b33e490096be6c7d8351cc91363571496f9ee8b9368.jpg",
+      "size": 945770,
+      "sha256": "6bf9354b85106302f1e75b33e490096be6c7d8351cc91363571496f9ee8b9368",
+      "archive_name_is_sha256": true
+    },
+    "jpgB": {
+      "file": "chatgpt-69beca28-ad34-8326-818a-dba8c39e883c/8b4f5fa78d410a5449f338cb12940da62bcd3f669880c69879e814c5d1e10fae.jpg",
+      "size": 733290,
+      "sha256": "8b4f5fa78d410a5449f338cb12940da62bcd3f669880c69879e814c5d1e10fae",
+      "archive_name_is_sha256": true
+    },
+    "webp": {
+      "file": "chatgpt-67a47e8f-7be4-800d-b293-f6607dfa0ee6/10712152094af622fe6a23757359a7e70d0f72566757031eb491e85a467de00d.webp",
+      "size": 535604,
+      "sha256": "10712152094af622fe6a23757359a7e70d0f72566757031eb491e85a467de00d",
+      "archive_name_is_sha256": true
+    },
+    "py": {
+      "file": "chatgpt-6a955f43-2a48-83ed-ab8f-a4f00a4c114b/36a9744c674cf29d77d6517cd8719f16cf4089068710e658ff626279e654f9e4.py",
+      "size": 10218,
+      "sha256": "36a9744c674cf29d77d6517cd8719f16cf4089068710e658ff626279e654f9e4",
+      "archive_name_is_sha256": true
+    },
+    "json": {
+      "file": "chatgpt-6a422372-6368-83ea-b57d-380fa30c29e3/3f9c5f083768c2a70ae18a0d77b8673c8d7231bab2f548faa67cf2ed04ab1d2b.json",
+      "size": 29673,
+      "sha256": "3f9c5f083768c2a70ae18a0d77b8673c8d7231bab2f548faa67cf2ed04ab1d2b",
+      "archive_name_is_sha256": true
+    }
+  },
+  "externalFetch": {
+    "https://images.unsplash.com/photo-1518791841217-8f162f1e1131?w=400": {
+      "ms": 426,
+      "ok": true,
+      "dataUriBytes": 28359,
+      "mimeLabel": "image/jpeg",
+      "sha256": "a5da8868159eb37c1a05a291ec5d7a2ac5a581d09c532c340cce846fd8e1974c"
+    },
+    "https://images.unsplash.com/photo-1518791841217-8f162f1e1131?w=1600": {
+      "ms": 1428,
+      "ok": true,
+      "dataUriBytes": 298542,
+      "mimeLabel": "image/jpeg",
+      "sha256": "f3a4e4806b19c46a776bc9dc45268de63a4eee42801fc57c3e355a9b593c59eb"
+    },
+    "https://chatgpt.com/backend-api/files/download/file_000000000000000000000000000000de": {
+      "ms": 329,
+      "ok": false,
+      "dataUriBytes": null,
+      "mimeLabel": null,
+      "sha256": null
+    }
+  },
+  "html": {
+    "bytes": 3421527,
+    "imgs": [
+      {
+        "kind": "data URI",
+        "mimeLabel": "image/jpeg",
+        "bytes": 945770,
+        "sha256": "6bf9354b85106302f1e75b33e490096be6c7d8351cc91363571496f9ee8b9368",
+        "matches": "jpgA"
+      },
+      {
+        "kind": "data URI",
+        "mimeLabel": "image/webp",
+        "bytes": 535604,
+        "sha256": "10712152094af622fe6a23757359a7e70d0f72566757031eb491e85a467de00d",
+        "matches": "webp"
+      },
+      {
+        "kind": "data URI",
+        "mimeLabel": "image/jpeg",
+        "bytes": 28357,
+        "sha256": "a5da8868159eb37c1a05a291ec5d7a2ac5a581d09c532c340cce846fd8e1974c",
+        "matches": null
+      },
+      {
+        "kind": "data URI",
+        "mimeLabel": "image/jpeg",
+        "bytes": 298541,
+        "sha256": "f3a4e4806b19c46a776bc9dc45268de63a4eee42801fc57c3e355a9b593c59eb",
+        "matches": null
+      },
+      {
+        "kind": "внешний URL",
+        "url": "https://chatgpt.com/backend-api/files/download/file_000000000000000000000000000000de"
+      },
+      {
+        "kind": "внешний URL",
+        "url": "https://chatgpt.com/backend-api/files/download/file_000000007c50722f9fb6ad9dc546a213"
+      },
+      {
+        "kind": "data URI",
+        "mimeLabel": "image/jpeg",
+        "bytes": 733290,
+        "sha256": "8b4f5fa78d410a5449f338cb12940da62bcd3f669880c69879e814c5d1e10fae",
+        "matches": "jpgB"
+      }
+    ],
+    "links": [
+      "https://ace.covai.org/",
+      "https://chatgpt.com/c/6aaa1f50-0e78-83eb-8c01-9153effd07ea",
+      "#msg-card-0",
+      "#msg-card-1",
+      "#msg-card-2",
+      "#msg-card-3",
+      "#msg-card-4",
+      "https://ace.covai.org/"
+    ],
+    "imagesTotalBytes": 2541562,
+    "originalsTotalBytes": 2214664,
+    "fileNamesInHtml": {
+      "25598.jpg": true,
+      "h3_text_validator.py": true,
+      "config.json": true,
+      "Younger_Lens_Availability_Guide.pdf": true
+    },
+    "documentBytesInHtml": {
+      "py_first64_base64_in_html": false,
+      "json_head_in_html": false
+    }
+  },
+  "dompurify": {
+    "available": true,
+    "ms": 5,
+    "htmlBytesBefore": 3421527,
+    "htmlBytesAfter": 3421527,
+    "imgsBefore": 7,
+    "imgsAfter": 7,
+    "dataUriImgsAfter": 5,
+    "sameDataUris": true
+  },
+  "strippedVariants": [
+    {
+      "role": "User",
+      "includeAttachments_false": "Подбери схему по фото.\n\n[Attached: 25598.jpg]"
+    },
+    {
+      "role": "Assistant",
+      "includeAttachments_false": "Принято."
+    },
+    {
+      "role": "User",
+      "includeAttachments_false": "Прилагаю файлы.\n\n[Attached: h3_text_validator.py, config.json, Younger_Lens_Availability_Guide.pdf]"
+    },
+    {
+      "role": "Assistant",
+      "includeAttachments_false": "Миниатюра из DOM:\n\nПолный размер:\n\nМёртвая ссылка:\n\nPDF как картинка:"
+    },
+    {
+      "role": "User",
+      "includeAttachments_false": "Ещё одно фото."
+    }
+  ],
+  "savedHtml": "C:\\Users\\User\\Documents\\Strata\\Workspace\\StrawberryEdition\\probe\\html_export_real.html"
+}
