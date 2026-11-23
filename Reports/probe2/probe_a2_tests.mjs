@@ -1,0 +1,916 @@
+/**
+ * Mock-тесты зонда chatgpt_asset_probe_nocookie.js (задача A-2).
+ * Только локальные стабы: реальной сети, ChatGPT и профиля браузера нет.
+ * Запуск: node probe_a2_tests.mjs [id теста ...]   (например: node probe_a2_tests.mjs 01 02)
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+export const SRC_PATH = path.join(HERE, 'chatgpt_asset_probe_nocookie.js');
+export const CDP_PATH = path.join(HERE, 'cdp_probe_run.mjs');
+export const SRC = fs.readFileSync(SRC_PATH, 'utf8');
+export const CDP_SRC = fs.readFileSync(CDP_PATH, 'utf8');
+
+export const SECRET_TOKEN = 'TokS3cr3t-9f2a';
+export const SECRET_TITLE = 'СекретноеНазваниеБеседы';
+export const SECRET_FILE = 'СекретныйОтчёт2026.pdf';
+export const SECRET_SIG = 'PODPISESECRET123';
+export const CHAT_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+export const ASSET_ID_RE = /\bfile_[0-9a-f]{16,}\b/i;
+
+// ---------- синтетические ответы API ----------
+function convFixture(i) {
+  const nodes = {};
+  const mk = (id, role, content, metadata, parent) => {
+    nodes[id] = { message: { id, parent_id: parent, author: { role }, content, metadata, children: [] } };
+  };
+  mk(`node_${i}_a`, 'user', { kind: 'message', parts: [{ content_type: 'text', text: 'ТЕКСТ_РЕПЛИКИ_НЕ_ДОЛЖЕН_ПОПАСТЬ_В_ОТЧЁТ' }] }, { attachments: [{ id: `file_0000000000000000000000000000${i}aa`, name: SECRET_FILE, mime_type: 'application/pdf', size: 1234 }] }, null);
+  nodes[`node_${i}_a`].message.children = [`node_${i}_b`];
+  mk(`node_${i}_b`, 'assistant', { kind: 'message', parts: [{ content_type: 'text', text: 'ответ' }] }, {}, `node_${i}_a`);
+  nodes[`node_${i}_b`].message.children = [`node_${i}_c`];
+  mk(`node_${i}_c`, 'user', { kind: 'message', parts: [{ content_type: 'image_asset_pointer', image_asset_pointer: `asset://${SECRET_FILE.replace('.pdf', '')}_gen_${i}` }] }, {}, `node_${i}_b`);
+  return { id: `conv_uuid_${i}`, title: SECRET_TITLE, created: '2026-01-0T00:00:00Z', updated: '2026-01-0T00:00:00Z', mapping: nodes, completion_codes: { '1234': 'ok' } };
+}
+
+function bytesFixture({ body = new TextEncoder().encode('GIF89a\x01\x02\x03\x04\x05MOREBYTES').buffer, contentLength, chunkSize = 4, extraHeaders = {} } = {}, stats = {}) {
+  const total = body.byteLength;
+  const headers = { 'content-type': 'image/gif', ...extraHeaders };
+  if (contentLength !== undefined) headers['content-length'] = String(contentLength);
+  else headers['content-length'] = String(total);
+  return {
+    ok: true, status: 200, url: '', type: 'basic',
+    headers: mkHeaders(headers),
+    body: {
+      getReader() {
+        stats.getReaderCalls = (stats.getReaderCalls ?? 0) + 1;
+        let pos = 0;
+        return {
+          read() {
+            if (pos >= total) return Promise.resolve({ done: true, value: undefined });
+            const end = Math.min(pos + chunkSize, total);
+            const value = new Uint8Array(body.slice(pos, end));
+            pos = end;
+            stats.reads = (stats.reads ?? 0) + 1;
+            stats.delivered = (stats.delivered ?? 0) + value.byteLength;
+            return Promise.resolve({ done: false, value });
+          },
+          cancel(reason) { stats.cancels = (stats.cancels ?? 0) + 1; stats.cancelReason = reason; return Promise.resolve(); },
+          closed: Promise.resolve(),
+        };
+      },
+    },
+    async arrayBuffer() { stats.arrayBufferCalls = (stats.arrayBufferCalls ?? 0) + 1; return body.slice(0); },
+  };
+}
+
+function mkHeaders(obj) {
+  const m = new Map(Object.entries(obj).map(([k, v]) => [k.toLowerCase(), v]));
+  return { get: (k) => (m.has(String(k).toLowerCase()) ? m.get(String(k).toLowerCase()) : null), entries: () => m.entries(), forEach: (f) => m.forEach(f) };
+}
+
+// Поток из готовых байт: так же, как тело ответа браузера, с учётом прочитанного и отмен.
+function streamBody(bytes, stats = {}, chunkSize = 256) {
+  const total = bytes.byteLength;
+  return {
+    getReader() {
+      stats.getReaderCalls = (stats.getReaderCalls ?? 0) + 1;
+      let pos = 0;
+      return {
+        read() {
+          if (pos >= total) return Promise.resolve({ done: true, value: undefined });
+          const end = Math.min(pos + chunkSize, total);
+          const value = bytes.slice(pos, end);
+          pos = end;
+          stats.reads = (stats.reads ?? 0) + 1;
+          stats.delivered = (stats.delivered ?? 0) + value.byteLength;
+          return Promise.resolve({ done: false, value });
+        },
+        cancel(reason) { stats.cancels = (stats.cancels ?? 0) + 1; stats.cancelReason = reason; return Promise.resolve(); },
+        closed: Promise.resolve(),
+      };
+    },
+    cancel(reason) { stats.cancels = (stats.cancels ?? 0) + 1; stats.cancelReason = reason; return Promise.resolve(); },
+  };
+}
+
+function jsonResponse(data, { status = 200, headers = { 'content-type': 'application/json' } } = {}, stats = {}) {
+  const text = JSON.stringify(data);
+  const bytes = new TextEncoder().encode(text);
+  return {
+    ok: status >= 200 && status < 300, status, url: '', type: 'basic',
+    headers: mkHeaders({ 'content-length': String(bytes.byteLength), ...headers }),
+    json: async () => data,
+    text: async () => text,
+    arrayBuffer: async () => bytes.buffer,
+    body: streamBody(bytes, stats),
+  };
+}
+
+// ---------- стаб среды браузера ----------
+export function makeEnv({ location, routes = {}, domExtra = {}, page = {} } = {}) {
+  const calls = [];
+  const timers = [];
+  const logs = [];
+  const domTouch = { createElement: 0, cookieReads: 0, scrollTopWrites: 0, textReads: 0, innerHtmlWrites: 0 };
+  const byteStats = { getReaderCalls: 0, reads: 0, cancels: 0, delivered: 0, arrayBufferCalls: 0 };
+
+  const loc = location ?? {
+    protocol: 'https:', hostname: 'chatgpt.com', host: 'chatgpt.com', origin: 'https://chatgpt.com',
+    pathname: '/c/6aaa1f50-0e78-83eb-8c01-9153effd07ea',
+    href: 'https://chatgpt.com/c/6aaa1f50-0e78-83eb-8c01-9153effd07ea',
+    search: '', hash: '',
+  };
+
+  const turnStub = (i) => {
+    const el = {
+      tagName: 'SECTION', id: '', className: 'streaming-turn',
+      getAttribute: (a) => (a === 'data-testid' ? `conversation-turn-${i}` : a === 'data-turn-id' ? String(i) : null),
+      scrollHeight: 4000, clientHeight: 800,
+      set scrollTop(v) { domTouch.scrollTopWrites += 1; }, get scrollTop() { return 120; },
+    };
+    el.parentElement = {
+      tagName: 'MAIN', className: 'main-root',
+      scrollHeight: 9000, clientHeight: 800,
+      set scrollTop(v) { domTouch.scrollTopWrites += 1; }, get scrollTop() { return 300; },
+      getAttribute: () => null,
+    };
+    return el;
+  };
+  const imgStub = (src) => ({ currentSrc: src, src });
+  const linkStub = (href) => ({ getAttribute: (a) => (a === 'href' ? href : null), href });
+
+  const doc = {
+    getElementById: (id) => (id === 'client-bootstrap' || id === '__NEXT_DATA__' ? { textContent: page.bootstrap ?? JSON.stringify({ session: { accessToken: SECRET_TOKEN } }) } : null),
+    querySelector: (sel) => (sel === 'main' ? { tagName: 'MAIN', scrollHeight: 9000, clientHeight: 800, set scrollTop(v) { domTouch.scrollTopWrites += 1; }, get scrollTop() { return 300; }, getAttribute: () => null } : null),
+    querySelectorAll: (sel) => {
+      if (sel.includes('conversation-turn') || sel.includes('article')) return [turnStub(0), turnStub(1), turnStub(2)];
+      if (sel === 'img') return [imgStub('https://chatgpt.com/files/auth/1.png'), imgStub('data:image/png;base64,AAAA'), imgStub((domExtra.imgSrc ?? ''))];
+      if (sel === 'a[href]') return [linkStub('/files/secret_local_name.pdf'), linkStub((domExtra.href ?? 'https://chatgpt.com/backend-api/files/download/file_0000000000000000000000000000aa?sig=SECRET_SIG_VALUE'))];
+      if (sel === '[data-message-id]') return [{}, {}];
+      if (sel === '[data-conversation-recovery]') return [];
+      return [];
+    },
+    createElement: (tag) => { domTouch.createElement += 1; return { tagName: tag.toUpperCase(), href: '', download: '', style: {}, setAttribute() {}, click() { domTouch.clicks = (domTouch.clicks ?? 0) + 1; }, remove() {}, appendChild() {} }; },
+    scrollingElement: { scrollHeight: 9000, clientHeight: 800, set scrollTop(v) { domTouch.scrollTopWrites += 1; }, get scrollTop() { return 300; } },
+    documentElement: { scrollHeight: 9000, clientHeight: 800, set scrollTop(v) { domTouch.scrollTopWrites += 1; }, get scrollTop() { return 300; } },
+    body: { innerText: 'СекретноеНазваниеБеседы и ещё текст страницы' },
+  };
+  Object.defineProperty(doc, 'cookie', { get() { domTouch.cookieReads += 1; throw new Error('COOKIE_READ_FORBIDDEN'); }, configurable: true });
+
+  const fetchStub = async (url, opts = {}) => {
+    const u = new URL(String(url), loc.origin);
+    calls.push({
+      url: String(url), host: u.host, path: u.pathname, method: opts.method ?? 'GET',
+      credentials: opts.credentials ?? 'same-origin', redirect: opts.redirect ?? 'follow',
+      headerNames: Object.keys(opts.headers ?? {}), hasAuth: Boolean(opts.headers?.Authorization),
+      hasCookieHeader: Object.keys(opts.headers ?? {}).some((h) => h.toLowerCase() === 'cookie'),
+      hasSignal: Boolean(opts.signal),
+      range: opts.headers?.Range ?? null,
+    });
+    if (u.host !== 'chatgpt.com') {
+      return routes.bytes ? routes.bytes(u) : bytesFixture({}, byteStats);
+    }
+    if (u.pathname.startsWith('/backend-api/conversation/')) return routes.conversation ? routes.conversation(u) : jsonResponse(convFixture(calls.length));
+    if (u.pathname.startsWith('/backend-api/files/download/')) return routes.download ? routes.download(u) : jsonResponse({ download_url: `https://cdn.test.invalid/dl/${u.pathname.split('/').pop()}?sig=${SECRET_SIG}&exp=1790000000`, expires_datetime: '2026-09-01T00:00:00Z' });
+    if (u.pathname.startsWith('/backend-api/files/')) return routes.metadata ? routes.metadata(u) : jsonResponse({ ok: true });
+    if (u.pathname === '/backend-api/files') return jsonResponse([]);
+    if (u.pathname.startsWith('/backend-api/conversations/')) return jsonResponse({ files: [] });
+    return routes.other ? routes.other(u) : jsonResponse({ unexpected: true });
+  };
+
+  class URLStable extends URL { static createObjectURL() { return 'blob:local/report'; } static revokeObjectURL() {} }
+  const consoleStable = { log: (...a) => logs.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')), warn: (...a) => logs.push('warn ' + a.join(' ')), error: (...a) => logs.push('error ' + a.join(' ')), info: () => {} };
+
+  return {
+    location: loc, document: doc, fetch: fetchStub, console: consoleStable, calls, timers, logs, domTouch, byteStats,
+    performance: { now: () => Number(process.hrtime.bigint() % 1000000n) },
+    setTimeout: (cb, ms) => { timers.push(ms ?? 0); cb(); return 0; },
+    URL: URLStable, Blob: class Blob { constructor() {} }, crypto: globalThis.crypto,
+  };
+}
+
+// Тестовые подстановки констант: меняем только значения настроек зонда, саму логику не трогаем.
+// Если якорь не найден — тест падает, а не тихо проверяет неизвестно что.
+const CHATS_BLOCK = `  const CHATS = [
+    { id: '6aaa1f50-0e78-83eb-8c01-9153effd07ea', note: 'новый чат, загруженные фото' },
+    { id: '6a955f43-2a48-83ed-ab8f-a4f00a4c114b', note: 'файлы .py' },
+    { id: '6a422372-6368-83ea-b57d-380fa30c29e3', note: '.json и .py' },
+    { id: '67a47e8f-7be4-800d-b293-f6607dfa0ee6', note: 'webp' },
+    { id: '69c1e80d-2f94-832b-ae42-194947247be0', note: 'PDF 10 МБ, в архиве статус missing' },
+    { id: '69beca28-ad34-8326-818a-dba8c39e883c', note: 'старый чат (март), фото' },
+  ];`;
+const EXTRA_BLOCK = `  const EXTRA_ASSET_IDS = [
+    'file_000000007c50722f9fb6ad9dc546a213', // Younger_Lens_Availability_Guide.pdf (missing)
+    'file_000000002dd481f4951b20e4ef2083c6', // jpg из чата 6aaa1f50
+  ];`;
+export const PATCH = {
+  // список чатов и идентификаторов в настройках зонда подменяем синтетическими,
+  // чтобы проверки меток были детерминированными
+  chats: [CHATS_BLOCK, "  const CHATS = [{ id: 'conv_uuid_0', note: 'фикстура' }, { id: 'conv_uuid_1', note: 'фикстура' }];"],
+  extra: [EXTRA_BLOCK, "  const EXTRA_ASSET_IDS = ['file_0000000000000000000000000000aa'];"],
+  cdn: (hosts) => ['const CDN_HOSTS = [];', `const CDN_HOSTS = [${hosts.map((h) => `'${h}'`).join(', ')}];`],
+  followRedirects: ['const CDN_FOLLOW_REDIRECTS = false;', 'const CDN_FOLLOW_REDIRECTS = true;'],
+  fileLimit: (n) => ['const MAX_BYTES_PER_FILE = 40 * 1024 * 1024;', `const MAX_BYTES_PER_FILE = ${n};`],
+  totalLimit: (n) => ['const MAX_TOTAL_BYTES = 200 * 1024 * 1024;', `const MAX_TOTAL_BYTES = ${n};`],
+  perChat: (n) => ['const MAX_FILES_PER_CHAT = 12;', `const MAX_FILES_PER_CHAT = ${n};`],
+  totalFiles: (n) => ['const MAX_TOTAL_FILES = 30;', `const MAX_TOTAL_FILES = ${n};`],
+  diagIds: ['const DIAGNOSTIC_IDS = false;', 'const DIAGNOSTIC_IDS = true;'],
+  linkCheck: ['const LINK_LIFETIME_CHECK = false;', 'const LINK_LIFETIME_CHECK = true;'],
+  jsonLimit: (n) => ['const MAX_JSON_BYTES = 4 * 1024 * 1024;', `const MAX_JSON_BYTES = ${n};`],
+};
+
+export async function runProbe(env, patches = []) {
+  const names = ['location', 'document', 'fetch', 'console', 'performance', 'setTimeout', 'URL', 'Blob', 'crypto'];
+  let src = SRC;
+  for (const [from, to] of patches) {
+    if (!src.includes(from)) fail(`в исходнике нет якоря «${from}»: тестовая подстановка не применена`);
+    src = src.replace(from, to);
+  }
+  const body = src.trimEnd().replace(/;\s*$/, '');
+  const fn = new Function(...names, `"use strict"; return (${body});`);
+  return await fn(env.location, env.document, env.fetch, env.console, env.performance, env.setTimeout, env.URL, env.Blob, env.crypto);
+}
+
+// ---------- мини-фреймворк ----------
+const tests = [];
+export const test = (id, name, fn) => tests.push({ id, name, fn });
+const results = [];
+const fail = (m) => { throw new Error(m); };
+const expect = (cond, m) => { if (!cond) fail(m); };
+export function scanLeaks(obj, label, extraBad = []) {
+  const s = typeof obj === 'string' ? obj : JSON.stringify(obj);
+  const bad = [];
+  if (CHAT_UUID_RE.test(s)) bad.push('uuid беседы');
+  if (ASSET_ID_RE.test(s)) bad.push('идентификатор ассета file_…');
+  if (s.includes(SECRET_TOKEN)) bad.push('значение токена');
+  if (s.includes(SECRET_TITLE)) bad.push('название беседы');
+  if (s.includes(SECRET_FILE)) bad.push('имя файла');
+  if (s.includes(SECRET_SIG)) bad.push('значение подписи из query');
+  if (/https?:\/\//.test(s)) bad.push('абсолютный URL');
+  if (/ТЕКСТ_РЕПЛИКИ/.test(s)) bad.push('текст реплики');
+  if (/secret_local_name/.test(s)) bad.push('href из DOM');
+  if (/"(title|name|file_name|filename|href|url|bodySample|signedUrl|convId|nodeId|messageId|assetId)"\s*:/.test(s)) bad.push('запрещённое поле');
+  for (const b of extraBad) if (s.includes(b)) bad.push(b);
+  if (bad.length) fail(`${label}: в отчёте/консоли найдено: ${bad.join(', ')}`);
+}
+
+export { jsonResponse, bytesFixture, mkHeaders, convFixture, tests, results, expect, fail };
+
+// ============================== ТЕСТЫ ==============================
+const apiCalls = (env) => env.calls.filter((c) => c.host === 'chatgpt.com');
+const dlCalls = (env) => env.calls.filter((c) => c.host !== 'chatgpt.com');
+
+test('01', 'статические гарантии: нет cookie, include, нигет-методов', () => {
+  const bad = [];
+  if (/document\s*\.\s*cookie/.test(SRC)) bad.push('document.cookie');
+  if (/credentials\s*:\s*['"]include['"]/.test(SRC)) bad.push("credentials: 'include'");
+  if (/\b(POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/.test(SRC.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''))) bad.push('негет-метод');
+  if (/READ_DEVICE_COOKIE/.test(SRC)) bad.push('READ_DEVICE_COOKIE');
+  if (/bodySample/.test(SRC)) bad.push('bodySample');
+  expect(bad.length === 0, bad.join(', '));
+});
+
+test('02', 'запросы: только GET, credentials omit, Bearer только на API', async () => {
+  const env = makeEnv();
+  // allowlist CDN нужен, чтобы путь загрузки вообще выполнялся: по умолчанию он пуст (этап 3)
+  const rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  expect(env.calls.length > 0, 'нет ни одного запроса');
+  for (const c of env.calls) expect(c.method === 'GET', `метод ${c.method} на ${c.path}`);
+  for (const c of apiCalls(env)) {
+    expect(c.credentials === 'omit', `credentials=${c.credentials} на ${c.path}`);
+    expect(!c.hasCookieHeader, 'cookie-заголовок передаётся');
+  }
+  expect(apiCalls(env).every((c) => c.hasAuth), 'на части API-запросов нет Authorization');
+  expect(dlCalls(env).length > 0, 'нет ни одной загрузки по подписной ссылке');
+  for (const c of dlCalls(env)) {
+    expect(c.credentials === 'omit', `загрузка: credentials=${c.credentials}`);
+    expect(!c.hasAuth, 'Authorization ушёл на CDN');
+  }
+  const dump = JSON.stringify(rep) + env.logs.join('\n');
+  expect(!dump.includes(SECRET_TOKEN), 'значение токена попало в отчёт/консоль');
+  expect(rep.hasAuthToken === true, 'hasAuthToken !== true');
+  expect(rep.hasDeviceId === null || rep.hasDeviceId === false, 'hasDeviceId должен быть null/false');
+  expect(env.domTouch.cookieReads === 0, 'cookie читались');
+});
+
+test('03', '401 на беседу -> AUTH_REQUIRED, без обхода через cookie', async () => {
+  const env = makeEnv({ routes: { conversation: () => jsonResponse({ detail: 'unauthorized' }, { status: 401 }) } });
+  const rep = await runProbe(env);
+  const auths = rep.chats.map((c) => c.fetch?.auth);
+  expect(auths.length > 0 && auths.every((a) => a === 'AUTH_REQUIRED'), `auth=${JSON.stringify(auths)}`);
+  expect(rep.chats.every((c) => c.fetch?.status === 401), 'статус 401 не зафиксирован');
+});
+
+test('04', 'скачивание байтов: без Authorization и без cookie, адрес в allowlist', async () => {
+  const env = makeEnv();
+  const rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  const assets = rep.chats.flatMap((c) => c.assets).filter((a) => a.bytes?.sha256);
+  expect(assets.length > 0, 'ни один файл не скачан');
+  const dump = JSON.stringify(assets);
+  expect(/cdn\.test\.invalid/.test(dump), 'хост загрузки не зафиксирован в отчёте');
+  expect(dlCalls(env).length > 0, 'запроса к CDN не было');
+  for (const c of dlCalls(env)) {
+    expect(!c.hasAuth && c.credentials === 'omit', 'авторизация/cookie ушли на CDN');
+    expect(c.redirect === 'manual', `redirect=${c.redirect}: автоматическое следование не отключено`);
+  }
+});
+
+test('06', 'дополнительные маршруты: статус авторизации зафиксирован', async () => {
+  const env = makeEnv({ routes: { metadata: () => jsonResponse({ detail: 'forbidden' }, { status: 403 }) } });
+  const rep = await runProbe(env);
+  const ep = rep.endpointProbes ?? {};
+  const names = Object.keys(ep);
+  expect(names.length >= 2, 'мало проверенных маршрутов');
+  for (const n of names) expect(typeof ep[n].auth === 'string', `маршрут ${n}: нет поля auth`);
+  const forbidden = names.filter((n) => /metadata/.test(n));
+  if (forbidden.length) expect(ep[forbidden[0]].auth === 'AUTH_REQUIRED', '403 не помечен AUTH_REQUIRED');
+});
+
+// --- проверки, которые должны заработать на соответствующих этапах ---
+test('05', 'контекст: чужой hostname / http / share -> отказ до запросов (этап 7)', async () => {
+  const cases = [
+    { loc: { protocol: 'http:', hostname: 'chatgpt.com', host: 'chatgpt.com', origin: 'http://chatgpt.com', pathname: '/c/6aaa1f50-0e78-83eb-8c01-9153effd07ea', href: 'http://chatgpt.com/c/6aaa1f50-0e78-83eb-8c01-9153effd07ea', search: '', hash: '' }, why: 'http' },
+    { loc: { protocol: 'https:', hostname: 'evil.example', host: 'evil.example', origin: 'https://evil.example', pathname: '/c/6aaa1f50-0e78-83eb-8c01-9153effd07ea', href: 'https://evil.example/c/6aaa1f50-0e78-83eb-8c01-9153effd07ea', search: '', hash: '' }, why: 'чужой hostname' },
+    { loc: { protocol: 'https:', hostname: 'chatgpt.com', host: 'chatgpt.com', origin: 'https://chatgpt.com', pathname: '/share/6aaa1f50-0e78-83eb-8c01-9153effd07ea', href: 'https://chatgpt.com/share/6aaa1f50-0e78-83eb-8c01-9153effd07ea', search: '', hash: '' }, why: 'share-страница' },
+  ];
+  for (const c of cases) {
+    const env = makeEnv({ location: c.loc });
+    let rep = null;
+    try { rep = await runProbe(env); } catch { /* отказ исключением тоже допустим, если до запросов */ }
+    if (env.calls.length) fail(`${c.why}: выполнено запросов ${env.calls.length}, ожидались 0`);
+    const st = JSON.stringify(rep ?? {});
+    if (rep && !/INVALID_CONTEXT/.test(st)) fail(`${c.why}: в отчёте нет INVALID_CONTEXT`);
+    if (env.domTouch.cookieReads) fail(`${c.why}: cookie всё-таки читались`);
+    if (env.domTouch.createElement) fail(`${c.why}: при отказе создаются элементы страницы`);
+  }
+
+  // 5.2 строгая проверка hostname: поддомен и «хвост» не принимаются
+  const strict = [
+    { pathname: '/c/6aaa1f50-0e78-83eb-8c01-9153effd07ea', hostname: 'chatgpt.com.evil.example', host: 'chatgpt.com.evil.example', origin: 'https://chatgpt.com.evil.example', protocol: 'https:', href: 'https://chatgpt.com.evil.example/c/x', search: '', hash: '' },
+    { pathname: '/c/x', hostname: 'www.chatgpt.com', host: 'www.chatgpt.com', origin: 'https://www.chatgpt.com', protocol: 'https:', href: 'https://www.chatgpt.com/c/x', search: '', hash: '' },
+    { pathname: '/c/x', hostname: 'chatgpt.com', host: 'chatgpt.com:8443', origin: 'https://chatgpt.com:8443', protocol: 'https:', href: 'https://chatgpt.com:8443/c/x', search: '', hash: '', port: '8443' },
+    { pathname: '/s/6aaa1f50-0e78-83eb-8c01-9153effd07ea', hostname: 'chatgpt.com', host: 'chatgpt.com', origin: 'https://chatgpt.com', protocol: 'https:', href: 'https://chatgpt.com/s/x', search: '', hash: '' },
+  ];
+  for (const loc of strict) {
+    const env = makeEnv({ location: loc });
+    const rep = await runProbe(env);
+    expect(env.calls.length === 0, `${loc.host}${loc.pathname}: запросов ${env.calls.length}, ожидалось 0`);
+    expect(/INVALID_CONTEXT/.test(JSON.stringify(rep)), `${loc.host}${loc.pathname}: нет INVALID_CONTEXT`);
+  }
+
+  // 5.3 нет токена на странице = нет признака авторизованного интерфейса: отказ до запросов
+  const envNoTok = makeEnv({ page: { bootstrap: JSON.stringify({ session: {} }) } });
+  const repNoTok = await runProbe(envNoTok);
+  expect(envNoTok.calls.length === 0, `без токена выполнено запросов ${envNoTok.calls.length}`);
+  expect(/no_auth_token/.test(JSON.stringify(repNoTok.context ?? {})), 'нет причины no_auth_token');
+
+  // 5.4 корректный контекст фиксируется в отчёте, запросы идут
+  const envOk = makeEnv();
+  const repOk = await runProbe(envOk);
+  expect(repOk.context?.status === 'OK', `контекст: ${JSON.stringify(repOk.context)}`);
+  expect(envOk.calls.length > 0, 'в корректном контексте запросов не было');
+
+  // 5.5 широкого совпадения подстрокой нет: host сверяется только строгим равенством
+  expect(!/hostname\s*\.\s*(includes|startsWith|endsWith|indexOf)/.test(SRC), 'hostname проверяется нестрогим сравнением');
+  expect(/location\.hostname !== API_HOST/.test(SRC), 'контекст проверяется не строгим равенством хоста');
+  expect(!/\.includes\(\s*['"]openai/i.test(SRC), 'в коде есть совпадение по подстроке openai');
+});
+
+test('07', 'минимизация отчёта: нет названий, имён, url, id, текстов (этап 6)', async () => {
+  const env = makeEnv();
+  const rep = await runProbe(env);
+  scanLeaks(rep, 'отчёт');
+  scanLeaks(env.logs.join('\n'), 'консоль');
+  for (const a of rep.chats.flatMap((c) => c.assets)) {
+    if (a.bytes?.firstBytesHex) expect(a.bytes.firstBytesHex.length <= 24, `firstBytesHex ${a.bytes.firstBytesHex.length} символов`);
+  }
+
+  // 7.1 локальные обозначения на месте
+  expect(rep.chats[0]?.chatLabel === 'chat_1', `метка чата: ${rep.chats[0]?.chatLabel}`);
+  const assetLabels = rep.chats.flatMap((c) => c.assets.map((a) => a.assetLabel));
+  expect(assetLabels.includes('asset_1'), `метки ассетов: ${assetLabels.join(',')}`);
+
+  // 7.2 связи сообщение -> вложение сохранены через обозначения
+  const samples = rep.chats.flatMap((c) => c.messagesSummary?.sampleWithAttachments ?? []);
+  expect(samples.length > 0, 'нет выборки сообщений с вложениями');
+  expect(samples.every((s) => s.messageLabel), 'у сообщения нет локальной метки');
+  for (const s of samples) {
+    for (const r of s.refs) expect(assetLabels.includes(r.assetLabel), `связь message->asset потеряна: ${r.assetLabel}`);
+    if (s.parentLabel) expect(s.parentLabel !== s.messageLabel, 'родитель и сообщение получили одну метку');
+  }
+
+  // 7.3 маршруты в статистике запросов нормализованы
+  const paths = Object.keys(rep.requests.byPath);
+  expect(paths.length > 0, 'статистика запросов пуста');
+  expect(paths.every((p) => /\/(conversation|download|files)\/<id>/.test(p) || !/(conversation|download|files)\//.test(p)), `не нормализовано: ${paths.join(' | ')}`);
+
+  // 7.4 адрес загрузки: hostname + нормализованный путь + имена параметров, без значений
+  const dt = rep.chats.flatMap((c) => c.assets).find((a) => a.downloadTarget)?.downloadTarget;
+  expect(dt, 'нет описания адреса загрузки');
+  expect(dt.host === 'cdn.test.invalid', `hostname загрузки: ${dt.host}`);
+  expect(dt.path.includes('<id>'), `путь не нормализован: ${dt.path}`);
+  expect(dt.queryParamNames?.includes('sig') && dt.queryParamNames.includes('exp'), `имена параметров: ${JSON.stringify(dt.queryParamNames)}`);
+
+  // 7.5 диагностический режим идентификаторов: по умолчанию выключен, включается явно
+  expect(rep.idAliases === null, 'идентификаторы включены по умолчанию');
+  // для проверки сопоставления меток берём синтетический список идентификаторов
+  const env2 = makeEnv();
+  const rep2 = await runProbe(env2, [PATCH.chats, PATCH.extra, PATCH.diagIds]);
+  expect(rep2.idAliases?.chat?.chat_1 === 'conv_uuid_0', `diagnostics: ${JSON.stringify(rep2.idAliases?.chat)}`);
+  expect(Object.keys(rep2.idAliases.chat).length >= 2, 'diagnostics: чатов меньше, чем в настройках');
+  const a1 = rep2.idAliases?.asset?.asset_1 ?? '';
+  expect(/^file_0+1aa$/.test(a1), `diagnostics assets: ${JSON.stringify(rep2.idAliases?.asset)}`);
+  const withoutAliases = { ...rep2 };
+  delete withoutAliases.idAliases;
+  expect(!JSON.stringify(withoutAliases).includes(a1), 'идентификатор ассета просочился в остальную часть отчёта');
+  expect(!JSON.stringify(withoutAliases).includes('conv_uuid_0'), 'идентификатор беседы просочился в остальную часть отчёта');
+  // в обычном режиме aliases нет, хотя идентификаторы в настройках те же
+  const env3 = makeEnv();
+  const rep3 = await runProbe(env3, [PATCH.chats, PATCH.extra]);
+  expect(rep3.idAliases === null, 'диагностический режим не выключен по умолчанию');
+  scanLeaks(rep3, 'отчёт при синтетических идентификаторах');
+
+  // 7.6 запрещённых полей в отчёте нет: имена файлов, названия бесед, сырые id и href
+  const flatKeys = new Set();
+  const walk = (o) => {
+    if (o && typeof o === 'object') for (const [k, v] of Object.entries(o)) { flatKeys.add(k); walk(v); }
+  };
+  walk(rep);
+  for (const k of ['title', 'name', 'file_name', 'filename', 'href', 'convId', 'nodeId', 'messageId', 'assetId', 'signedUrl', 'linksToFiles', 'bodySample']) {
+    expect(!flatKeys.has(k), `в отчёте есть поле ${k}`);
+  }
+  expect(flatKeys.has('titlePresent') && flatKeys.has('namePresentApi'), 'нет булевых признаков вместо значений');
+});
+
+const redirectResponse = (loc) => ({
+  ok: false, status: 302, type: 'basic', url: '',
+  headers: mkHeaders({ location: loc }), body: null,
+  json: async () => null, arrayBuffer: async () => new ArrayBuffer(0),
+});
+
+test('08', 'allowlist адресов, порты, userinfo, redirect, небезопасные id (этап 3)', async () => {
+  // 8.1 неизвестный CDN-хост: файл не качается, фиксируется UNTRUSTED_DOWNLOAD_HOST
+  let env = makeEnv();
+  let rep = await runProbe(env);
+  let assets = rep.chats.flatMap((c) => c.assets).filter((a) => a.bytes);
+  expect(assets.length > 0, 'нет записей о попытке загрузки');
+  expect(assets.every((a) => a.bytes.status === 'UNTRUSTED_DOWNLOAD_HOST'), `статусы: ${assets.map((a) => a.bytes.status).join(',')}`);
+  expect(dlCalls(env).length === 0, `запрос к неразрешённому хосту: ${dlCalls(env).length}`);
+  expect(JSON.stringify(rep.cdnHostsSeen ?? []).includes('cdn.test.invalid'), 'hostname загрузки не зафиксирован');
+
+  // 8.2 http вместо https
+  env = makeEnv({ routes: { download: () => jsonResponse({ download_url: 'http://cdn.test.invalid/x?sig=x' }) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  expect(dlCalls(env).length === 0, 'разрешён http-адрес загрузки');
+  expect(/not_https/.test(JSON.stringify(rep.chats)), 'нет причины not_https');
+
+  // 8.3 посторонний порт и userinfo
+  env = makeEnv({ routes: { download: () => jsonResponse({ download_url: 'https://cdn.test.invalid:8443/x?sig=x' }) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  expect(dlCalls(env).length === 0, 'посторонний порт не заблокирован');
+  expect(/unexpected_port/.test(JSON.stringify(rep.chats)), 'нет причины unexpected_port');
+  env = makeEnv({ routes: { download: () => jsonResponse({ download_url: 'https://cdn.test.invalid@evil.example/x' }) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  expect(dlCalls(env).length === 0, 'userinfo не заблокирован');
+  expect(/userinfo_in_url/.test(JSON.stringify(rep.chats)), 'нет причины userinfo_in_url');
+
+  // 8.4 redirect по умолчанию не выполняется: ни одного запроса на хост из Location
+  env = makeEnv({ routes: { bytes: () => redirectResponse('https://cdn2.test.invalid/f') } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
+  expect(assets.length > 0 && assets.every((a) => a.bytes.status === 'UNTRUSTED_DOWNLOAD_HOST' && /redirect/.test(String(a.bytes.reason))), `redirect не зафиксирован как отказ: ${JSON.stringify(assets.map((a) => a.bytes))}`);
+  expect(dlCalls(env).every((c) => c.host === 'cdn.test.invalid'), 'выполнен запрос на хост из Location');
+  const paths = dlCalls(env).map((c) => c.path);
+  expect(new Set(paths).size === paths.length, 'один и тот же адрес запрошен дважды (лишний переход)');
+
+  // 8.5 redirect с явным разрешением, но чужой хост: второй запрос не уходит
+  env = makeEnv({ routes: { bytes: () => redirectResponse('https://evil.example/f') } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.followRedirects]);
+  expect(dlCalls(env).every((c) => c.host === 'cdn.test.invalid'), 'переход на чужой хост выполнился');
+  expect(/redirect/.test(JSON.stringify(rep.chats)), 'нет записи о redirect');
+
+  // 8.6 redirect на разрешённый хост при явном разрешении: загрузка состоялась
+  let firstHop = true;
+  env = makeEnv({
+    routes: {
+      bytes: () => {
+        if (firstHop) { firstHop = false; return redirectResponse('https://cdn2.test.invalid/f'); }
+        return bytesFixture({}, {});
+      },
+    },
+  });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid', 'cdn2.test.invalid']), PATCH.followRedirects]);
+  const okAssets = rep.chats.flatMap((c) => c.assets).filter((a) => a.bytes?.status === 'OK');
+  expect(okAssets.length > 0, 'redirect на разрешённый хост не привёл к загрузке');
+  const hostsSeen = [...new Set(dlCalls(env).map((c) => c.host))].sort();
+  expect(hostsSeen.join(',') === 'cdn.test.invalid,cdn2.test.invalid', `хосты загрузок: ${hostsSeen.join(',')}`);
+  expect(dlCalls(env).every((c) => c.redirect === 'manual'), 'есть запрос с автоматическим redirect');
+
+  // 8.7 небезопасный идентификатор ассета не меняет маршрут запроса
+  const evil = convFixture(9);
+  evil.mapping['node_9_a'].message.metadata.attachments[0].id = 'file_x/../other';
+  evil.mapping['node_9_c'].message.content.parts[0].image_asset_pointer = 'asset://file_y/../other';
+  env = makeEnv({ routes: { conversation: () => jsonResponse(evil) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  const recs = rep.chats.flatMap((c) => c.assets);
+  expect(recs.length > 0 && recs.every((r) => r.filesDownloadEndpoint?.reason === 'asset_id_unsafe'), `небезопасный id не заблокирован: ${JSON.stringify(recs.slice(0, 2))}`);
+  expect(env.calls.every((c) => !/\/download\/file_[xy](\/|$)/.test(c.path)), 'запрос с небезопасным id всё равно ушёл');
+
+  // 8.8 маршруты backend-api заданы явно, хосты сравниваются точно, а не по подстроке
+  expect(!/(?:host|hostname|domain)\s*\.\s*(?:includes|startsWith|endsWith|indexOf)\s*\(/.test(SRC), 'есть неточная проверка хоста');
+});
+
+const bigBody = (n) => new Uint8Array(n).fill(65).buffer;
+const FL = 2000; // лимит на файл в этих тестах: больше заявленного размера фикстуры (1234 б),
+                 // чтобы срабатывал именно контроль загрузки, а не предварительная отбраковка
+
+test('09', 'потоковые лимиты объёма (этап 4)', async () => {
+  // 9.1 Content-Length сверх лимита файла: чтение не начинается вообще
+  let env = makeEnv({ routes: { bytes: () => bytesFixture({ body: bigBody(5000), contentLength: 999 * 1024 }, {}) } });
+  let rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL)]);
+  let assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
+  expect(assets.length > 0, 'нет записей о загрузках');
+  expect(assets.every((a) => a.bytes.status === 'SKIPPED_LIMIT' && a.bytes.reason === 'content_length_over_limit'), `статусы: ${assets.map((a) => a.bytes.status + '/' + a.bytes.reason).join(', ')}`);
+  expect(rep.downloaded.filesDownloaded === 0 && rep.downloaded.downloadedBytesTotal === 0, 'отклонённое засчитано как скачанное');
+
+  // 9.2 Content-Length отсутствует: лимит проверяется по фактически принятым байтам, поток прерывается
+  const st = {};
+  env = makeEnv({ routes: { bytes: () => bytesFixture({ body: bigBody(4000), contentLength: 0, chunkSize: 4 }, st) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL)]);
+  assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
+  expect(assets.every((a) => a.bytes.status === 'SKIPPED_LIMIT' && a.bytes.reason === 'stream_over_limit'), `потоковый лимит не сработал: ${JSON.stringify(assets[0]?.bytes)}`);
+  expect(assets.every((a) => a.bytes.receivedBytes <= FL), 'накоплено больше лимита');
+  expect(st.cancels >= 1, 'поток не прерван (cancel не вызван)');
+  expect(st.getReaderCalls >= 1, 'потоковое чтение не использовалось');
+  expect(rep.downloaded.filesDownloaded === 0 && rep.downloaded.downloadedBytesTotal === 0, 'прерванная загрузка засчитана как успешная');
+  expect(assets.every((a) => a.bytes.countedInTotals === false), 'прерванная загрузка помечена засчитанной');
+
+  // 9.3 Общий лимит прогона не обходится ни успешными, ни неудачными загрузками; он же
+  // ограничивает и чтение JSON-ответов. Проверяем инварианты, а не точное число загрузок:
+  // суммарный объём сети не превышает потолок, принятые байты кратны фактическим размерам,
+  // а само исчерпание бюджета видно в отчёте.
+  env = makeEnv({ routes: { bytes: () => bytesFixture({ body: bigBody(900), contentLength: 900 }, {}) } });
+  const measured = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL)]);
+  const apiBytes = measured.downloaded.apiBytesRead;
+  expect(apiBytes > 0, 'объём API-ответов не измерен');
+  const runLimit = apiBytes + 1500;
+  env = makeEnv({ routes: { bytes: () => bytesFixture({ body: bigBody(900), contentLength: 900 }, {}) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL), PATCH.totalLimit(runLimit)]);
+  assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
+  const ok = assets.filter((a) => a.bytes.status === 'OK');
+  const skipped = assets.filter((a) => a.bytes.status === 'SKIPPED_LIMIT');
+  expect(rep.downloaded.apiBytesRead <= apiBytes, `объём API-ответов вырос: ${rep.downloaded.apiBytesRead} против ${apiBytes}`);
+  expect(ok.length >= 1, `ни одной успешной загрузки при потолке ${runLimit}: ${JSON.stringify(assets.map((a) => a.bytes.reason))}`);
+  expect(ok.every((a) => a.bytes.sizeBytes === 900), `размеры успешных: ${ok.map((a) => a.bytes.sizeBytes).join(',')}`);
+  expect(ok.every((a) => a.bytes.contentLengthMatchesActual === true), 'размер из content-length не сверен с фактическим');
+  expect(rep.downloaded.downloadedBytesTotal === ok.length * 900, `принято байт: ${rep.downloaded.downloadedBytesTotal}`);
+  expect(rep.downloaded.bytesReadFromNetwork <= runLimit, `лимит сети превышен: ${rep.downloaded.bytesReadFromNetwork} > ${runLimit}`);
+  expect(ok.length * 900 <= runLimit, `принятые байты превышают лимит прогона: ${ok.length * 900}`);
+  expect(skipped.length > 0 && skipped.every((a) => /limit/.test(String(a.bytes.reason))), 'нет отказа по общему лимиту');
+  expect(rep.downloaded.apiBytesRead + ok.length * 900 <= rep.downloaded.bytesReadFromNetwork, `счётчики не сходятся: ${JSON.stringify(rep.downloaded)}`);
+  expect(rep.chats.some((c) => /limit/.test(String(c.fetch.jsonRead?.reason ?? ''))) || skipped.some((a) => a.bytes.reason === 'total_limit_before_start'), 'исчерпание общего бюджета сети не видно в отчёте');
+
+  // 9.4 Лимит количества файлов за прогон считается по попыткам
+  env = makeEnv({ routes: { bytes: () => bytesFixture({}, {}) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL), PATCH.totalFiles(1)]);
+  expect(dlCalls(env).length === 1, `запросов на CDN: ${dlCalls(env).length}, ожидался 1`);
+  assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
+  expect(assets.some((a) => a.bytes.reason === 'file_count_limit'), 'нет отказа file_count_limit');
+
+  // 9.5 Загрузки строго последовательные: одновременных было не больше одной
+  expect(rep.downloaded.maxConcurrentDownloads === 1, `одновременных загрузок: ${rep.downloaded.maxConcurrentDownloads}`);
+
+  // 9.6 Лимиты в отчёте приведены фактические, а не предполагаемые
+  expect(rep.downloaded.limitBytesPerFile === FL && rep.downloaded.limitBytesTotalRun === 209715200, `лимиты в отчёте: ${JSON.stringify(rep.downloaded)}`);
+  expect(rep.downloaded.limitFilesPerChat === 12 && rep.downloaded.limitFilesPerRun === 1, `лимиты файлов: ${JSON.stringify(rep.downloaded)}`);
+
+  // 9.7 При недоступном потоке — понятный статус, а не неограниченное чтение
+  env = makeEnv({ routes: { bytes: () => ({ ok: true, status: 200, type: 'basic', headers: mkHeaders({ 'content-type': 'image/gif' }), body: null, arrayBuffer: async () => bigBody(10 * 1024 * 1024) }) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL)]);
+  assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
+  expect(assets.every((a) => a.bytes.status === 'UNSUPPORTED' && a.bytes.reason === 'stream_unavailable'), `отсутствие потока не обработано: ${JSON.stringify(assets[0]?.bytes)}`);
+  expect(rep.downloaded.filesDownloaded === 0, 'чтение без потока засчитано');
+});
+
+test('10', 'повторная загрузка выключена по умолчанию (этап 5)', async () => {
+  // 10.1 обычный прогон: ни одного повторного запроса байтов, никаких длительных пауз
+  let env = makeEnv({ routes: { bytes: () => bytesFixture({}, {}) } });
+  let rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  const dl = dlCalls(env);
+  expect(dl.length > 0, 'в обычном прогоне загрузок не было');
+  const urls = dl.map((c) => c.url);
+  expect(new Set(urls).size === urls.length, `повторный запрос байтов: ${urls.length - new Set(urls).size}`);
+  expect(rep.linkLifetimeCheck?.enabled === false, 'режим проверки живости ссылки включён по умолчанию');
+  expect((rep.linkLifetimeCheck?.results ?? []).length === 0, 'в обычном прогоне есть результаты второй фазы');
+  // Длительные таймеры допустимы только как таймауты ожидания ответа: они прерывают запрос,
+  // а не создают паузу. Значения берутся из самого зонда, чтобы тест не разъехался с кодом.
+  const apiTimeout = Number((SRC.match(/const API_HEAD_TIMEOUT_MS = (\d+)/) || [])[1]);
+  const dlTimeout = Number((SRC.match(/const DOWNLOAD_HEAD_TIMEOUT_MS = (\d+)/) || [])[1]);
+  expect(apiTimeout > 0 && dlTimeout > 0, 'в зонде не заданы таймауты ожидания ответа (этап 16)');
+  const bigTimers = env.timers.filter((t) => t >= 10000 && t !== apiTimeout && t !== dlTimeout);
+  expect(bigTimers.length === 0, `пауза ${bigTimers.join(',')} мс в обычном режиме`);
+  const litTimers = [...SRC.matchAll(/setTimeout\([^)]*,\s*(\d+)\s*\)/g)].map((m) => Number(m[2])).filter((n) => n >= 10000);
+  expect(litTimers.length === 0, `в коде жёсткая пауза ${litTimers.join(',')} мс`);
+  const dump = JSON.stringify(rep);
+  expect(!/recheckAfterMs|RECHECK_AFTER_MS/.test(dump), 'в отчёте осталась 90-секундная пауза');
+  expect(dl.every((c) => c.range === null), 'в обычном прогоне ушёл Range-запрос');
+
+  // 10.2 включённый режим: ограниченный GET Range, полного файла не скачиваем
+  const rangeFixture = (stats = {}) => {
+    const r = bytesFixture({ body: new Uint8Array(1024).fill(66).buffer, contentLength: 1024, chunkSize: 64 }, stats);
+    return { ...r, status: 206, headers: mkHeaders({ 'content-type': 'application/pdf', 'content-length': '1024', 'content-range': 'bytes 0-1023/5000' }) };
+  };
+  const st = {};
+  env = makeEnv({ routes: { bytes: () => rangeFixture(st) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.linkCheck]);
+  const range = dlCalls(env).filter((c) => String(c.range ?? '').startsWith('bytes=0-'));
+  expect(range.length > 0, 'Range-запрос не отправлен');
+  expect(range.length === rep.linkLifetimeCheck.results.length, `Range-запросов ${range.length}, результатов ${rep.linkLifetimeCheck.results.length}`);
+  expect(rep.linkLifetimeCheck.results.every((r) => r.method === 'range_get' && r.status === 'OK'), `метод/статус: ${JSON.stringify(rep.linkLifetimeCheck.results.map((r) => [r.method, r.status]))}`);
+  expect(rep.linkLifetimeCheck.results.every((r) => r.rangeHonored === true && r.httpStatus === 206), 'поддержка Range не проверена по ответу');
+  expect(rep.linkLifetimeCheck.results.every((r) => r.receivedBytes <= 1024), 'прочитано больше разрешённого');
+  expect(rep.linkLifetimeCheck.results.every((r) => r.fullFileDownloaded === false), 'скачан полный файл');
+  expect(!st.arrayBufferCalls, 'вторая фаза читает через arrayBuffer');
+  expect(rep.linkLifetimeCheck.bytesTotalRead <= 5 * 1024, `объём второй фазы: ${rep.linkLifetimeCheck.bytesTotalRead}`);
+  expect(rep.linkLifetimeCheck.results.every((r) => r.firstBytesHexNow && r.firstBytesHexNow.length <= 24), 'сигнатура первых байтов не ограничена');
+  expect(rep.linkLifetimeCheck.results.every((r) => r.firstBytesUnchanged === true), 'совпадение первых байтов не сравнено');
+
+  // 10.3 если Range не поддерживается (200 + полный ответ), полный файл не накапливается
+  env = makeEnv({ routes: { bytes: () => bytesFixture({ body: new Uint8Array(20000).fill(67).buffer, contentLength: 20000, chunkSize: 512 }, {}) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.linkCheck]);
+  const res = rep.linkLifetimeCheck.results;
+  expect(res.length > 0 && res.every((r) => r.rangeHonored === false), 'ответ без 206 не помечен как неподдержка Range');
+  expect(res.every((r) => r.status === 'SKIPPED_LIMIT' && r.receivedBytes === 0), 'полный ответ прочитан целиком');
+
+  // 10.4 Range проигнорирован, Content-Length нет: поток обрывается на лимите, память не растёт
+  const st2 = {};
+  env = makeEnv({ routes: { bytes: () => bytesFixture({ body: new Uint8Array(30000).fill(67).buffer, contentLength: 0, chunkSize: 400 }, st2) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.linkCheck]);
+  const res2 = rep.linkLifetimeCheck.results;
+  expect(res2.length > 0 && res2.every((r) => r.rangeHonored === false), 'нет отметки о неподдержке Range');
+  expect(res2.every((r) => r.reason === 'stream_over_limit' && r.receivedBytes <= 1025), `лимит потока не сработал: ${JSON.stringify(res2[0])}`);
+  expect(st2.cancels >= 1, 'поток не прерван');
+  expect(rep.linkLifetimeCheck.bytesTotalRead <= 5 * 1025, `объём второй фазы: ${rep.linkLifetimeCheck.bytesTotalRead}`);
+});
+
+test('12', 'зонд не меняет DOM и не прокручивает (этап 7)', async () => {
+  const env = makeEnv();
+  await runProbe(env);
+  expect(env.domTouch.scrollTopWrites === 0, `записей scrollTop: ${env.domTouch.scrollTopWrites}`);
+  expect(!/location\s*=\s*|location\.assign|location\.replace|window\.scroll/.test(SRC), 'в коде есть навигация/прокрутка окна');
+});
+
+// Аудит CDP-запускателя: комментарии, строки справки и сами выражения для страницы не участвуют —
+// проверяется только исполняемый код.
+const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+const CDP_CODE = stripComments(CDP_SRC);
+const CDP_BARE = CDP_CODE
+  .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+  .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+  .replace(/`(?:[^`\\]|\\.)*`/g, '``');
+
+test('11', 'CDP-запускатель: выключен по умолчанию, без автовыбора, навигации и текста страницы (этап 8)', async () => {
+  // 11.1 явный выключатель
+  expect(/CDP_ALLOW/.test(CDP_CODE), 'нет явного разрешения на запуск');
+  expect(/process\.env\[ALLOW_ENV\]\s*!==\s*'1'/.test(CDP_CODE), 'проверка разрешения отсутствует');
+  expect(/exitCode\s*=\s*2/.test(CDP_CODE), 'отказ не приводит к ненулевому коду возврата');
+
+  // 11.2 нет автовыбора вкладки и автосоздания вкладок
+  expect(/t\.id === targetId/.test(CDP_CODE), 'target не сопоставляется с переданным id');
+  expect(!/\.find\(\s*\(t\)\s*=>\s*t\.type === 'page'/.test(CDP_CODE), 'есть автовыбор первой страницы');
+  expect(!/Target\.createTarget|Target\.attach|Target\.activateTarget/.test(CDP_BARE), 'запускатель создаёт или переключает вкладки');
+  expect(!/Page\.navigate|location\s*=\s*|location\.assign|location\.replace/.test(CDP_BARE), 'запускатель выполняет переходы');
+  expect(!/Page\.enable|Page\.loadEventFired/.test(CDP_BARE), 'запускатель включает Page-домен и ждёт загрузки');
+
+  // 11.3 нет извлечения содержимого страницы
+  expect(!/bodySample|innerText|document\.title/.test(CDP_BARE), 'код читает текст или заголовок страницы');
+  expect(!/document\.cookie|Network\.getCookies|Network\.setCookie/.test(CDP_BARE), 'запускатель трогает cookie');
+  // в самой диагностике тоже только булевы признаки и счётчики
+  const checkExpr = (CDP_SRC.match(/const CHECK_ONLY = `([\s\S]*?)`;/) || [])[1] ?? '';
+  expect(checkExpr.length > 0, 'не найден блок диагностики');
+  expect(!/innerText|document\.title|bodySample/.test(checkExpr), 'диагностика выводит текст страницы');
+  for (const key of ['hasAuthToken', 'hasComposer', 'isSharePage', 'turnNodes']) {
+    expect(checkExpr.includes(key), `диагностика не возвращает ${key}`);
+  }
+
+  // 11.4 адрес вкладки проверяется до выполнения кода
+  expect(/u\.protocol !== 'https:'/.test(CDP_CODE), 'нет проверки https для адрес вкладки');
+  expect(/u\.hostname !== API_HOST/.test(CDP_CODE), 'нет строгой проверки hostname вкладки');
+  expect(/const API_HOST = 'chatgpt\.com'/.test(CDP_CODE), 'эталонный hostname не задан явно');
+  expect(/share\|s/.test(CDP_CODE), 'share-вкладка не отвергается');
+
+  // 11.5 сводка отчёта в консоли не печатает личных данных: только обозначения и счётчики
+  expect(!/c\.id\b|c\.title|c\.name|convId/.test(CDP_CODE), 'в сводке печатаются реальные идентификаторы или названия');
+  expect(/chatLabel/.test(CDP_CODE), 'в сводке нет локальных обозначений чатов');
+
+  // 11.6 запускатель по умолчанию не трогает сеть: код обращения к порту идёт только после всех отказов
+  const idxRefuse = CDP_CODE.indexOf("process.exitCode = 2");
+  const idxFetch = CDP_CODE.indexOf("await http('/json/list')");
+  expect(idxRefuse >= 0 && idxFetch > idxRefuse, 'обращение к порту возможно до проверки отказа');
+});
+
+test('13', 'учёт байтов из сети и общий лимит прогона (этап 11)', async () => {
+  // 13.1 Загрузка, оборванная по лимиту, всё равно израсходовала общий лимит прогона.
+  const st = {};
+  let env = makeEnv({ routes: { bytes: () => bytesFixture({ body: bigBody(4000), contentLength: 0, chunkSize: 400 }, st) } });
+  let rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL), PATCH.totalLimit(1500)]);
+  let assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
+  const cut = assets.filter((a) => a.bytes.reason === 'stream_over_limit');
+  const stopped = assets.filter((a) => a.bytes.reason === 'total_limit_before_start');
+  expect(cut.length >= 1, `нет оборванной загрузки: ${assets.map((a) => a.bytes.reason).join(', ')}`);
+  // Исчерпание общего бюджета видно либо по отказу скачивания, либо по обрезанному JSON-ответу:
+  // с этапа 16 лимит сети ограничивает и ответы API, поэтому поздние беседы могут и не дойти до файлов.
+  const jsonStopped = rep.chats.filter((c) => /limit/.test(String(c.fetch.jsonRead?.reason ?? '')));
+  expect(stopped.length + jsonStopped.length >= 1, `общий лимит не остановил прогон: ${assets.map((a) => a.bytes.reason).join(', ')} / json: ${rep.chats.map((c) => c.fetch.jsonRead?.reason ?? 'нет').join(', ')}`);
+  expect(rep.downloaded.bytesReadFromNetwork >= 1500, `получено из сети ${rep.downloaded.bytesReadFromNetwork} б, ожидалось не меньше лимита 1500`);
+  expect(rep.downloaded.bytesReadFromNetwork > rep.downloaded.downloadedBytesTotal, 'общий лимит считается только по принятым байтам');
+  expect(rep.downloaded.downloadedBytesTotal === 0, `принятые байты: ${rep.downloaded.downloadedBytesTotal}`);
+  expect(dlCalls(env).length === cut.length, `запросов к CDN: ${dlCalls(env).length}, оборванных загрузок ${cut.length}: после исчерпания лимита запросов быть не должно`);
+  expect(stopped.every((a) => a.bytes.countedInTotals !== true), 'остановка по лимиту помечена засчитанной');
+
+  // 13.2 Отбраковка по content-length до чтения: по сети ничего не шло из файла, счётчик не растёт.
+  env = makeEnv({ routes: { bytes: () => bytesFixture({ body: bigBody(5000), contentLength: 999 * 1024 }, {}) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL)]);
+  const assets2 = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
+  expect(assets2.length > 0 && assets2.every((a) => (a.bytes.receivedBytes ?? 0) === 0), 'при отбраковке по content-length из сети пришли байты файла');
+  expect(rep.downloaded.bytesReadFromNetwork === rep.downloaded.apiBytesRead, `счётчик сети ${rep.downloaded.bytesReadFromNetwork} не равен объёму API ${rep.downloaded.apiBytesRead}: засчитаны байты файлов`);
+
+  // 13.3 В отчёте разведены «получено из сети» и «принято»: оба счётчика видны
+  expect('bytesReadFromNetwork' in rep.downloaded && 'downloadedBytesTotal' in rep.downloaded, `в отчёте нет пары счётчиков: ${JSON.stringify(rep.downloaded)}`);
+});
+
+test('14', 'корректность sha256 при несовпадении content-length (этап 12)', async () => {
+  const { createHash } = await import('node:crypto');
+  const shaHex = (u8) => createHash('sha256').update(u8).digest('hex');
+  const body = new Uint8Array(900).fill(65);
+
+  // 14.1 Тело короче заявленного content-length: хэш по фактическим байтам, без нулевого хвоста
+  let env = makeEnv({ routes: { bytes: () => bytesFixture({ body: body.buffer, contentLength: 1200, chunkSize: 100 }, {}) } });
+  let rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL)]);
+  let ok = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes?.status === 'OK');
+  expect(ok.length >= 1, `нет успешных загрузок: ${JSON.stringify(rep.chats.flatMap((c) => c.assets).map((a) => a.bytes))}`);
+  const b = ok[0].bytes;
+  expect(b.sizeBytes === 900, `размер: ${b.sizeBytes}`);
+  expect(b.hashOverBytes === 900, `хэш посчитан по ${b.hashOverBytes} б, ожидалось 900`);
+  expect(b.contentLengthMatchesActual === false, 'несоответствие content-length не зафиксировано');
+  expect(b.sha256 === shaHex(body), `sha256 не соответствует фактическим байтам: ${b.sha256}`);
+  expect(b.sha256 !== shaHex(new Uint8Array(1200).fill(65)), 'sha256 посчитан по предвыделенному буферу — старый дефект вернулся');
+  expect(b.firstBytesHex === '41'.repeat(12), `первые байты: ${b.firstBytesHex}`);
+
+  // 14.2 Тело длиннее заявленного content-length: тоже хэш по фактическим байтам
+  env = makeEnv({ routes: { bytes: () => bytesFixture({ body: body.buffer, contentLength: 500, chunkSize: 100 }, {}) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL)]);
+  ok = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes?.status === 'OK');
+  expect(ok.length >= 1, 'нет успешных загрузок при длинном теле');
+  expect(ok[0].bytes.sha256 === shaHex(body), `sha256 при длинном теле: ${ok[0].bytes.sha256}`);
+  expect(ok[0].bytes.sizeBytes === 900 && ok[0].bytes.hashOverBytes === 900, `байты: ${JSON.stringify(ok[0].bytes)}`);
+});
+
+test('15', 'тела ответов отменяются при раннем отказе (этап 13)', async () => {
+  const sites = (SRC.match(/await discardBody\(/g) ?? []).length;
+  expect(sites >= 5, `мест закрытия тел ответов в коде: ${sites}, ожидалось не меньше 5`);
+
+  // 15.1 API отдал не-JSON: тело не читается целиком, а закрывается
+  let cancels = 0;
+  const htmlResp = (status, headers) => ({
+    ok: status >= 200 && status < 300, status, url: '', type: 'basic',
+    headers: mkHeaders({ 'content-type': 'text/html', 'content-length': '4000', ...headers }),
+    json: async () => ({}), text: async () => '<html>секретный html</html>',
+    body: { cancel: async () => { cancels += 1; } },
+  });
+  let env = makeEnv({ routes: { conversation: () => htmlResp(200) } });
+  let rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  expect(cancels >= 1, 'тело не-JSON ответа API не закрыто');
+  expect(JSON.stringify(rep).includes('text/html'), 'contentType ответа не зафиксирован в отчёте');
+
+  // 15.2 Redirect подписной ссылки: тело 3xx закрывается до любого разбора
+  cancels = 0;
+  env = makeEnv({ routes: { bytes: () => ({ ok: false, status: 302, url: '', type: 'basic', headers: mkHeaders({ location: 'https://cdn2.test.invalid/x' }), body: { cancel: async () => { cancels += 1; } } }) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  let assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
+  expect(assets.some((a) => a.bytes.reason === 'redirect_not_followed'), `redirect не зафиксирован: ${JSON.stringify(assets[0]?.bytes)}`);
+  expect(cancels >= assets.filter((a) => a.bytes.reason === 'redirect_not_followed').length, 'тело 3xx-ответа не закрыто');
+
+  // 15.3 CDN отдал HTTP-ошибку: используется только статус, тело закрыто
+  cancels = 0;
+  env = makeEnv({ routes: { bytes: () => ({ ok: false, status: 404, url: '', type: 'basic', headers: mkHeaders({ 'content-type': 'text/html', 'content-length': '2000' }), body: { cancel: async () => { cancels += 1; } } }) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
+  expect(assets.length > 0 && assets.every((a) => a.bytes.status === 'HTTP_ERROR' && a.bytes.httpStatus === 404), `статусы: ${assets.map((a) => a.bytes.status + '/' + a.bytes.httpStatus).join(', ')}`);
+  expect(cancels >= 1, 'тело HTTP-ошибки не закрыто');
+
+  // 15.4 Отбраковка по content-length: поток закрывается, не начав читаться
+  const st = {};
+  env = makeEnv({ routes: { bytes: () => bytesFixture({ body: bigBody(5000), contentLength: 999 * 1024 }, st) } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL)]);
+  expect(st.cancels >= 1, `поток не закрыт при отбраковке по content-length, cancels ${st.cancels ?? 0}`);
+  expect(!st.reads, 'тело читалось после отбраковки по content-length');
+});
+
+test('16', 'нормализация путей: только литеральные сегменты из явного списка (этап 14)', async () => {
+  expect(!/PLAIN_SEGMENT/.test(SRC), 'в коде осталось старое правило «буквы = смысловой сегмент»');
+  const TOKEN_SEG = 'sigonlytoken';
+  const env = makeEnv({ routes: { download: () => jsonResponse({ download_url: `https://cdn.test.invalid/${TOKEN_SEG}/qq/9f8e/dl/file_0000000000000000000000000000aa?sig=${SECRET_SIG}&exp=1790000000` }) } });
+  const rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.fileLimit(FL)]);
+  const dump = JSON.stringify(rep);
+  expect(!dump.includes(TOKEN_SEG), `буквенный подписной сегмент утёк в отчёт: ${TOKEN_SEG}`);
+  const dt = rep.chats.flatMap((c) => c.assets).find((a) => a.downloadTarget)?.downloadTarget;
+  expect(dt, 'нет описания адреса загрузки');
+  expect(dt.path === '/<id>/<id>/<id>/<id>/<id>', `путь загрузки: ${dt.path}`);
+  expect(dt.pathSegments === 5, `число сегментов: ${dt.pathSegments}`);
+  expect(rep.pagePathTemplate === '/c/<id>', `путь страницы: ${rep.pagePathTemplate}`);
+  const apiPaths = Object.keys(rep.requests.byPath).filter((p) => p.includes('backend-api'));
+  expect(apiPaths.length > 0 && apiPaths.every((p) => /^GET \/backend-api\/(conversation|files|conversations)/.test(p)), `маршруты API: ${apiPaths.join(' | ')}`);
+  expect(Array.isArray(rep.pathWordsAllowlist) && rep.pathWordsAllowlist.includes('conversation'), 'список литеральных слов не выведен в отчёт');
+});
+
+test('17', 'CDP-запускатель: адрес в выводе без реальных идентификаторов (этап 15)', async () => {
+  expect(/pathShape\(u\.pathname\)/.test(CDP_CODE), 'адрес вкладки печатается без нормализации пути');
+  const m = CDP_SRC.match(/const PATH_WORDS = new Set\(\[[\s\S]*?\]\);[\s\S]*?const pathShape = \(pathname\) =>[\s\S]*?\.join\('\/'\);/);
+  expect(m, 'нормализация пути в запускателе не извлекается для проверки');
+  const shape = new Function(`${m[0]}; return pathShape;`)();
+  const uuid = '6aaa1f50-0e78-83eb-8c01-9153effd07ea';
+  expect(shape(`/c/${uuid}`) === '/c/<id>', `форма пути страницы: ${shape(`/c/${uuid}`)}`);
+  expect(shape(`/share/${uuid}`) === '/share/<id>', `форма share-пути: ${shape(`/share/${uuid}`)}`);
+  expect(shape('/oabqzsigntoken/qq/9f8e') === '/<id>/<id>/<id>', `форма подписного пути: ${shape('/oabqzsigntoken/qq/9f8e')}`);
+  expect(!CHAT_UUID_RE.test(shape(`/c/${uuid}`)), 'в форме адреса остался реальный uuid');
+
+  const checkRaw = (CDP_SRC.match(/const CHECK_ONLY = `([\s\S]*?)`;/) || [])[1] ?? '';
+  expect(checkRaw, 'CHECK_ONLY не найден');
+  expect(/pathTemplate/.test(checkRaw), 'в диагностике нет нормализованной формы пути');
+  const checkExpr = checkRaw.replace(/\\\\/g, '\\'); // снятие экранирования шаблонной строки исходника
+  const stubDoc = {
+    getElementById: () => ({ textContent: JSON.stringify({ session: { accessToken: 'TOKEN_NOT_SHOWN' } }) }),
+    querySelector: () => null,
+    querySelectorAll: () => [1, 2, 3],
+  };
+  const diag = (pathname) =>
+    new Function('document', 'location', `return (${checkExpr})`)(stubDoc, { protocol: 'https:', host: 'chatgpt.com', hostname: 'chatgpt.com', pathname });
+  const d1 = diag(`/c/${uuid}`);
+  expect(!CHAT_UUID_RE.test(JSON.stringify(d1)), `в выводе диагностики есть реальный идентификатор: ${JSON.stringify(d1)}`);
+  expect(d1.pathTemplate === '/c/<id>', `pathTemplate: ${d1.pathTemplate}`);
+  expect(d1.origin === 'https://chatgpt.com', `origin: ${d1.origin}`);
+  expect(d1.hasAuthToken === true && d1.turnNodes === 3, `признаки: ${JSON.stringify(d1)}`);
+  const d2 = diag(`/share/${uuid}`);
+  expect(d2.isSharePage === true && d2.pathTemplate === '/share/<id>', `share: ${JSON.stringify(d2)}`);
+  expect(!CHAT_UUID_RE.test(JSON.stringify(d2)), `в share-выводе есть реальный идентификатор: ${JSON.stringify(d2)}`);
+});
+
+test('18', 'размер JSON-ответа и таймауты ожидания ответа (этап 16)', async () => {
+  // 18.1 JSON ответа крупнее предела: тело читается частично, JSON не парсится, прогон продолжается
+  let env = makeEnv();
+  let rep = await runProbe(env, [PATCH.jsonLimit(300)]);
+  expect(rep.aborted !== true, 'прогон прервался из-за большого JSON');
+  expect(rep.chats.length > 1, `чатов в отчёте: ${rep.chats.length}`);
+  const fr = rep.chats[0].fetch;
+  expect(fr.jsonRead && fr.jsonRead.status === 'SKIPPED_LIMIT', `чтение JSON не зафиксировано: ${JSON.stringify(fr.jsonRead)}`);
+  expect(fr.jsonRead.limitBytes === 300, `предел в отчёте: ${fr.jsonRead.limitBytes}`);
+  expect((rep.chats[0].assets ?? []).length === 0, 'неразобранный JSON дал вложения');
+  expect(rep.chats.every((c) => (c.fetch.jsonRead?.receivedBytes ?? 0) <= 300), `предел 300 б превышен у отдельных ответов: ${rep.chats.map((c) => c.fetch.jsonRead?.receivedBytes).join(',')}`);
+  expect(rep.downloaded.apiBytesRead <= 300 * rep.chats.length, `объём API-ответов ${rep.downloaded.apiBytesRead} не ограничен пределом на ответ`);
+  expect(rep.chats.some((c) => c.fetch.jsonRead?.status === 'SKIPPED_LIMIT'), 'ни один ответ не отбракован по размеру');
+  expect(!/ТЕКСТ_РЕПЛИКИ/.test(JSON.stringify(rep)), 'в отчёт попал текст из неразобранного JSON');
+
+  // 18.2 Таймаут ожидания ответа классифицируется как NETWORK_ERROR с причиной, а не как молчаливый отказ
+  const timeoutThrow = () => {
+    const e = new Error('The operation was aborted due to timeout');
+    e.seHeadTimeout = true;
+    throw e;
+  };
+  env = makeEnv({ routes: { conversation: timeoutThrow } });
+  rep = await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
+  expect(rep.chats.length > 1, 'прогон не дошёл до остальных чатов');
+  const f2 = rep.chats[0].fetch;
+  expect(f2.status === null && f2.timeout === true, `таймаут не зафиксирован: ${JSON.stringify(f2)}`);
+  expect(f2.reason === 'request_timeout', `причина таймаута: ${f2.reason}`);
+  expect(f2.auth === 'NETWORK_ERROR', `классификация авторизации: ${f2.auth}`);
+  expect(env.calls.length > 0 && env.calls.every((c) => c.hasSignal), 'запрос ушёл без AbortSignal');
+  expect(rep.aborted === true || (rep.chats ?? []).every((c) => (c.assets ?? []).length === 0), 'после таймаута остались необъяснённые вложения');
+
+  // 18.3 Статические гарантии: сырой r.json() не используется, пределы и таймауты заданы явно
+  expect(!/await r\.json\(\)/.test(SRC), 'ответ по-прежнему читается через r.json() целиком');
+  expect(/MAX_JSON_BYTES/.test(SRC), 'предел размера JSON не задан');
+  expect(/new AbortController\(\)/.test(SRC), 'прерывание запроса не реализовано');
+  expect(rep.flags.MAX_JSON_BYTES > 0 && rep.flags.API_HEAD_TIMEOUT_MS > 0 && rep.flags.DOWNLOAD_HEAD_TIMEOUT_MS > 0, `флаги лимитов: ${JSON.stringify(rep.flags)}`);
+  expect(rep.abortControllerSupported === true, 'поддержка AbortController не зафиксирована в отчёте');
+});
+
+// ---------- запуск ----------
+const want = process.argv.slice(2);
+for (const t of tests.sort((a, b) => a.id.localeCompare(b.id))) {
+  if (want.length && !want.includes(t.id)) continue;
+  try {
+    await t.fn();
+    console.log(`${t.id} PASS  ${t.name}`);
+    results.push({ id: t.id, ok: true });
+  } catch (e) {
+    console.log(`${t.id} FAIL  ${t.name}\n      ${e.message}`);
+    results.push({ id: t.id, ok: false, msg: e.message });
+  }
+}
+const bad = results.filter((r) => !r.ok);
+console.log(`\nитого: ${results.length} тестов, провалено ${bad.length}`);
+process.exitCode = bad.length ? 1 : 0;
+
