@@ -1,0 +1,555 @@
+diff --git "a/C:\\Users\\User\\AppData\\Local\\Temp\\probe_a2_tests.stage17_reviewed.mjs" b/probe_a2_tests.mjs
+index 0c54525..f4b66e3 100644
+--- "a/C:\\Users\\User\\AppData\\Local\\Temp\\probe_a2_tests.stage17_reviewed.mjs"
++++ b/probe_a2_tests.mjs
+@@ -118,9 +118,10 @@ export async function settleWithin(promise, clock, limitMs = 60000, stepMs = 500
+ }
+ 
+ // Управляемый AbortController: видно, сколько контроллеров создано, сколько раз вызван
+-// abort(), с какой причиной и сколько слушателей у сигнала. Повторный abort() счётчик не удваивает.
++// abort(), с какой причиной, сколько слушателей навешано и сколько ещё живых. Повторный
++// abort() счётчик отмен не удваивает. Живые слушатели — это индикатор утечки фикстуры.
+ export function makeAbortHub(getNow = () => 0) {
+-  const hub = { created: 0, aborts: [], signals: 0 };
++  const hub = { created: 0, aborts: [], signals: 0, listenersAdded: 0, listenersRemoved: 0, signalList: [] };
+   class AbortSignalStable {
+     constructor() {
+       this.aborted = false;
+@@ -128,12 +129,19 @@ export function makeAbortHub(getNow = () => 0) {
+       this.onabort = null;
+       this._listeners = [];
+       hub.signals += 1;
++      hub.signalList.push(this);
++    }
++    addEventListener(type, cb) {
++      if (type !== 'abort' || typeof cb !== 'function') return;
++      this._listeners.push(cb);
++      hub.listenersAdded += 1;
+     }
+-    addEventListener(type, cb) { if (type === 'abort' && typeof cb === 'function') this._listeners.push(cb); }
+     removeEventListener(type, cb) {
+       if (type !== 'abort') return;
+       const i = this._listeners.indexOf(cb);
+-      if (i >= 0) this._listeners.splice(i, 1);
++      if (i < 0) return;
++      this._listeners.splice(i, 1);
++      hub.listenersRemoved += 1;
+     }
+     throwIfAborted() {
+       if (!this.aborted) return;
+@@ -159,16 +167,26 @@ export function makeAbortHub(getNow = () => 0) {
+       }
+     }
+   }
++  hub.liveListeners = () => hub.signalList.reduce((n, s) => n + s._listeners.length, 0);
+   return { hub, AbortController: AbortControllerStable, AbortSignal: AbortSignalStable };
+ }
+ 
+ // Поток-фикстура с режимами, которых обычный поток из байт не даёт:
+-//   stallAfter  — после N отданных чанков следующий read() навсегда висит, его отклоняет отмена;
++//   stallAfter  — после N отданных чанков следующий read() навсегда висит;
+ //   failAfter   — после N отданных чанков read() отклоняется (обрыв соединения);
+ //   delayChunks — задержка мс виртуального времени между чанками (медленный канал);
+ //   cancelMode  — 'immediate' | 'delayed' | 'never' | 'syncThrow' — как ведёт себя cancel().
+-// stats собирает всю наблюдаемую картину: reads, delivered, cancels, stalledReads,
+-// readRejectsAbort, readsAfterCancel, cancelSettled, cancelThrows и другие счётчики.
++// Семантика отмены разделена, как у настоящего ReadableStream:
++//   снятие AbortSignal -> висящее и следующее чтение отклоняются с AbortError;
++//   reader.cancel()    -> поток закрывается: висящее и следующие чтения дают done: true,
++//                         данных после отмены не выдаётся никогда;
++//   закрытие потока (closed) не зависит от того, завершился ли промис underlying cancel():
++//   cancel() закрывает поток сразу, а его промис отвечает только за исход отмены.
++// Задержанный чанк не считается выданным: delivered растёт только в момент фактической
++// выдачи; при отмене задержанный чанк снимается с часов и не выдаётся.
++// stats собирает наблюдаемую картину: reads, delivered, cancels, stalledReads,
++// readRejectsAbort, pendingReadsClosed, readsAfterCancel, delayedChunksScheduled/
++// Delivered/Dropped, cancelSettled, cancelThrows, closedState, signalListenersDetached.
+ export function makeStream(bytes, opts = {}, stats = {}) {
+   const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+   const total = view.byteLength;
+@@ -181,18 +199,33 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+   let pos = 0;
+   let chunksGiven = 0;
+   let cancelled = false;
+-  let pendingRead = null;
++  let pendingRead = null;      // зависший read()
++  let pendingChunk = null;     // задержанный чанк: запланирован, но ещё не выдан
+   let signal = opts.signal ?? null;
++  let signalListener = null;   // прикреплённый слушатель abort, чтобы снять его
+   let closedResolve = null;
++  let closedReject = null;
+   let closedSettled = false;
+-  const closed = new Promise((resolve) => { closedResolve = resolve; });
+-  const markClosed = () => {
++  const closed = new Promise((resolve, reject) => { closedResolve = resolve; closedReject = reject; });
++  closed.catch(() => {});      // отклонение закрытия не рождает необработанного отклонения
++
++  const closeStream = (state) => {
+     if (closedSettled) return;
+     closedSettled = true;
++    stats.closedState = state;
+     bump('closedResolved');
+-    if (closedResolve) closedResolve();
++    if (state === 'errored' && closedReject) closedReject(new Error('поток закрыт выбросом cancel()'));
++    else if (closedResolve) closedResolve();
++  };
++  const detachSignal = () => {
++    if (!signal || !signalListener) return false;
++    if (typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', signalListener);
++    signalListener = null;
++    bump('signalListenersDetached');
++    return true;
+   };
+-  const rejectPendingRead = (reasonText) => {
++  // Отмена через сигнал: чтение отклоняется ошибкой AbortError.
++  const abortPendingRead = (reasonText) => {
+     if (!pendingRead) return false;
+     const p = pendingRead;
+     pendingRead = null;
+@@ -200,26 +233,85 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+     bump('readRejectsAbort');
+     return true;
+   };
++  // Обычный cancel(): поток закрывается, ожидающее чтение завершается как done без данных.
++  const finishPendingReadAsDone = () => {
++    if (!pendingRead) return false;
++    const p = pendingRead;
++    pendingRead = null;
++    p.resolve({ done: true, value: undefined });
++    bump('pendingReadsClosed');
++    return true;
++  };
++  const dropPendingChunk = (why, reasonText = '') => {
++    if (!pendingChunk) return false;
++    const pc = pendingChunk;
++    pendingChunk = null;
++    if (clock && pc.timerId !== null) clock.clearTimeout(pc.timerId);
++    bump('delayedChunksDropped');
++    stats.droppedChunkBytes = (stats.droppedChunkBytes ?? 0) + (pc.to - pc.from);
++    stats.droppedChunkWhy = why;
++    if (why === 'signal_abort') {
++      bump('readRejectsAbort');
++      pc.reject(abortErrorStable(reasonText || 'поток прерван сигналом во время задержки чанка'));
++    } else {
++      bump('doneReads');
++      pc.resolve({ done: true, value: undefined });
++    }
++    return true;
++  };
+   const onAbort = () => {
+     if (!signal || !signal.aborted) return;
+     bump('abortSeen');
+-    rejectPendingRead(`поток прерван сигналом: ${describeReason(signal.reason)}`);
++    dropPendingChunk('signal_abort', `поток прерван сигналом: ${describeReason(signal.reason)}`);
++    abortPendingRead(`поток прерван сигналом: ${describeReason(signal.reason)}`);
++    detachSignal();
+   };
+   const attachSignal = (sig) => {
+     if (!sig) return;
++    if (signalListener) detachSignal();
+     signal = sig;
+     bump('signalsAttached');
++    if (typeof sig.addEventListener !== 'function') return;
++    sig.addEventListener('abort', onAbort);
++    signalListener = onAbort;
+     if (sig.aborted) onAbort();
+-    else if (typeof sig.addEventListener === 'function') sig.addEventListener('abort', onAbort);
+   };
+   if (signal) attachSignal(signal);
+ 
++  function deliver(from, to, viaDelay, resolve, reject) {
++    if (cancelled) {
++      bump('readsAfterCancel');
++      bump('doneReads');
++      if (viaDelay) bump('delayedChunksDropped');
++      resolve({ done: true, value: undefined });
++      return;
++    }
++    if (signal && signal.aborted) {
++      bump('readRejectsAbort');
++      if (viaDelay) bump('delayedChunksDropped');
++      reject(abortErrorStable(`поток прерван сигналом: ${describeReason(signal.reason)}`));
++      return;
++    }
++    const value = view.slice(from, to);
++    pos = to;
++    chunksGiven += 1;
++    bump('reads');
++    bump('delivered', value.byteLength);
++    if (viaDelay) bump('delayedChunksDelivered');
++    resolve({ done: false, value });
++  }
++
+   function readChunk() {
+-    if (cancelled) bump('readsAfterCancel');
++    if (pendingChunk) bump('concurrentReads');
+     if (signal && signal.aborted) {
+       bump('readRejectsAbort');
+       return Promise.reject(abortErrorStable(`поток прерван сигналом: ${describeReason(signal.reason)}`));
+     }
++    if (cancelled) {
++      bump('readsAfterCancel');
++      bump('doneReads');
++      return Promise.resolve({ done: true, value: undefined });
++    }
+     if (opts.stallAfter !== null && opts.stallAfter !== undefined && chunksGiven >= opts.stallAfter) {
+       bump('stalledReads');
+       return new Promise((resolve, reject) => {
+@@ -233,19 +325,25 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+     }
+     if (pos >= total) {
+       bump('doneReads');
+-      markClosed();
++      closeStream('closed');
++      detachSignal();
+       return Promise.resolve({ done: true, value: undefined });
+     }
+-    const end = Math.min(pos + chunkSize, total);
+-    const value = view.slice(pos, end);
++    const from = pos;
++    const to = Math.min(pos + chunkSize, total);
+     const delay = Array.isArray(opts.delayChunks) ? (opts.delayChunks[chunksGiven] ?? 0) : (opts.delayChunks ?? 0);
+     if (delay && !clock) throw new Error('delayChunks требует виртуальные часы clock в makeStream');
+-    pos = end;
+-    chunksGiven += 1;
+-    bump('reads');
+-    bump('delivered', value.byteLength);
+-    if (!delay) return Promise.resolve({ done: false, value });
+-    return new Promise((resolve) => { clock.setTimeout(() => resolve({ done: false, value }), delay); });
++    if (!delay) return new Promise((resolve, reject) => deliver(from, to, false, resolve, reject));
++    bump('delayedChunksScheduled');
++    return new Promise((resolve, reject) => {
++      const pc = { from, to, timerId: null, resolve, reject };
++      pendingChunk = pc;
++      pc.timerId = clock.setTimeout(() => {
++        if (pendingChunk !== pc) return;   // чанк уже отменён: часы сняты, данные не выдаются
++        pendingChunk = null;
++        deliver(from, to, true, resolve, reject);
++      }, delay);
++    });
+   }
+ 
+   function doCancel(reason) {
+@@ -253,8 +351,11 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+     stats.cancelReason = reason;
+     stats.cancelMode = cancelMode;
+     stats.chunksGivenAtCancel = chunksGiven;
+-    rejectPendingRead(`поток прерван cancel(${describeReason(reason)})`);
++    dropPendingChunk('cancel');
++    finishPendingReadAsDone();
+     cancelled = true;
++    closeStream(cancelMode === 'syncThrow' ? 'errored' : 'cancelled');
++    detachSignal();
+     if (cancelMode === 'syncThrow') {
+       bump('cancelThrows');
+       throw new Error('fixture_cancel_sync_throw');
+@@ -267,11 +368,10 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+       if (!clock) throw new Error('cancelMode delayed требует виртуальные часы clock в makeStream');
+       bump('cancelStarted');
+       return new Promise((resolve) => {
+-        clock.setTimeout(() => { bump('cancelSettled'); markClosed(); resolve(); }, cancelDelayMs);
++        clock.setTimeout(() => { bump('cancelSettled'); resolve(); }, cancelDelayMs);
+       });
+     }
+     bump('cancelSettled');
+-    markClosed();
+     return Promise.resolve();
+   }
+ 
+@@ -281,11 +381,13 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+     cancel: (reason) => doCancel(reason),
+     closed,
+     __attachSignal: attachSignal,
++    __detachSignal: detachSignal,
+     __stats: stats,
+   };
+   return body;
+ }
+ 
++
+ // ---------- синтетические ответы API ----------
+ function convFixture(i) {
+   const nodes = {};
+@@ -392,22 +494,10 @@ export function makeEnv({ location, routes = {}, domExtra = {}, page = {} } = {}
+   };
+   Object.defineProperty(doc, 'cookie', { get() { domTouch.cookieReads += 1; throw new Error('COOKIE_READ_FORBIDDEN'); }, configurable: true });
+ 
++  // Маршрут ответа: только выбор фикстуры по адресу. Журнал запроса и учёт сигнала ведёт
++  // fetchStub — так слушатель abort можно снять, когда запрос завершится.
+   const routeCall = async (url, opts = {}) => {
+     const u = new URL(String(url), loc.origin);
+-    const rec = {
+-      url: String(url), host: u.host, path: u.pathname, method: opts.method ?? 'GET',
+-      credentials: opts.credentials ?? 'same-origin', redirect: opts.redirect ?? 'follow',
+-      headerNames: Object.keys(opts.headers ?? {}), hasAuth: Boolean(opts.headers?.Authorization),
+-      hasCookieHeader: Object.keys(opts.headers ?? {}).some((h) => h.toLowerCase() === 'cookie'),
+-      hasSignal: Boolean(opts.signal),
+-      range: opts.headers?.Range ?? null,
+-    };
+-    calls.push(rec);
+-    if (opts.signal) {
+-      const mark = () => { rec.signalAbortedAt = clock.now(); };
+-      if (opts.signal.aborted) mark();
+-      else if (typeof opts.signal.addEventListener === 'function') opts.signal.addEventListener('abort', mark);
+-    }
+     if (u.host !== 'chatgpt.com') {
+       return routes.bytes ? routes.bytes(u) : bytesFixture({}, byteStats);
+     }
+@@ -429,18 +519,24 @@ export function makeEnv({ location, routes = {}, domExtra = {}, page = {} } = {}
+       hangings.push(rec);
+       return new Promise((resolve, reject) => {
+         let settled = false;
++        let detach = null;
+         const finish = (kind, payload) => {
+           if (settled) return;
+           settled = true;
+           rec.aborted = kind === 'abort';
+           rec.resolvedAt = clock.now();
++          if (detach) { detach(); detach = null; }
+           if (kind === 'abort') reject(payload);
+           else resolve(payload);
+         };
+         if (opts.signal) {
+           if (opts.signal.aborted) return finish('abort', abortErrorStable(`сигнал уже снят: ${describeReason(opts.signal.reason)}`));
+           if (typeof opts.signal.addEventListener === 'function') {
+-            opts.signal.addEventListener('abort', () => finish('abort', abortErrorStable(`fetch прерван сигналом: ${describeReason(opts.signal.reason)}`)));
++            const onAbort = () => finish('abort', abortErrorStable(`fetch прерван сигналом: ${describeReason(opts.signal.reason)}`));
++            opts.signal.addEventListener('abort', onAbort);
++            detach = () => {
++              if (typeof opts.signal.removeEventListener === 'function') opts.signal.removeEventListener('abort', onAbort);
++            };
+           }
+         }
+         if (typeof res.resolveAfterMs === 'number' && res.resolveAfterMs >= 0 && clock) {
+@@ -459,7 +555,36 @@ export function makeEnv({ location, routes = {}, domExtra = {}, page = {} } = {}
+     }
+     return res;
+   });
+-  const fetchStub = (url, opts = {}) => withAbort(routeCall(url, opts), opts, url);
++  // Точка входа fetch: журнал запроса, учёт снятого сигнала и обязательное снятие слушателя
++  // abort, когда запрос заверчился (ответ получен или запрос отклонён).
++  const fetchStub = (url, opts = {}) => {
++    const u = new URL(String(url), loc.origin);
++    const rec = {
++      url: String(url), host: u.host, path: u.pathname, method: opts.method ?? 'GET',
++      credentials: opts.credentials ?? 'same-origin', redirect: opts.redirect ?? 'follow',
++      headerNames: Object.keys(opts.headers ?? {}), hasAuth: Boolean(opts.headers?.Authorization),
++      hasCookieHeader: Object.keys(opts.headers ?? {}).some((h) => h.toLowerCase() === 'cookie'),
++      hasSignal: Boolean(opts.signal),
++      range: opts.headers?.Range ?? null,
++    };
++    calls.push(rec);
++    let detachSignal = null;
++    if (opts.signal) {
++      const mark = () => { rec.signalAbortedAt = clock.now(); };
++      if (opts.signal.aborted) mark();
++      else if (typeof opts.signal.addEventListener === 'function') {
++        opts.signal.addEventListener('abort', mark);
++        detachSignal = () => {
++          if (typeof opts.signal.removeEventListener === 'function') opts.signal.removeEventListener('abort', mark);
++        };
++      }
++    }
++    const release = () => { if (detachSignal) { detachSignal(); detachSignal = null; rec.signalListenerRemoved = true; } };
++    return withAbort(routeCall(url, opts), opts, url).then(
++      (v) => { release(); return v; },
++      (e) => { release(); throw e; },
++    );
++  };
+ 
+   class URLStable extends URL { static createObjectURL() { return 'blob:local/report'; } static revokeObjectURL() {} }
+   const consoleStable = { log: (...a) => logs.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')), warn: (...a) => logs.push('warn ' + a.join(' ')), error: (...a) => logs.push('error ' + a.join(' ')), info: () => {} };
+@@ -1352,6 +1477,40 @@ test('I3', 'инфраструктура: зависающий и обрываю
+   }
+   expect(st4.reads === 4 && st4.delivered === 700 && st4.doneReads === 1, `обычный поток: ${JSON.stringify(st4)}`);
+   expect(reads === 4, `прочитано чанков ${reads}, ожидалось 4`);
++
++  // I3.5 Отложенный чанк отменяется через cancel(): данные не выдаются, delivered не растёт,
++  // таймер снимается с часов, чтение завершается как done.
++  const st5 = {};
++  const clock5 = makeClock();
++  const s5 = makeStream(bytes, { chunkSize: 1000, delayChunks: 500, clock: clock5 }, st5);
++  const r5 = s5.getReader();
++  const planned = r5.read();
++  expect(st5.delayedChunksScheduled === 1 && st5.delivered === undefined, `запланированный чанк учтён как выданный: ${JSON.stringify(st5)}`);
++  let out5 = await settleWithin(planned, clock5, 300, 100);
++  expect(out5.state === 'pending', 'отложенный чанк выдан раньше виртуальной задержки');
++  s5.cancel('cancel_во_время_задержки');
++  out5 = await settleWithin(planned, clock5, 5000, 1000);
++  expect(out5.state === 'ok' && out5.value.done === true && out5.value.value === undefined, `cancel() не закрыл отложенный чанк: ${out5.state}`);
++  expect(st5.delayedChunksDropped === 1 && st5.delayedChunksDelivered === undefined, `учёт отменённого чанка: ${JSON.stringify(st5)}`);
++  expect(st5.droppedChunkBytes === 1000 && st5.droppedChunkWhy === 'cancel', `байты отменённого чанка: ${st5.droppedChunkBytes} (${st5.droppedChunkWhy})`);
++  expect(st5.delivered === undefined, `delivered вырос после отмены: ${st5.delivered}`);
++  expect(clock5.live() === 0, `после отмены на часах остался таймер чанка: ${JSON.stringify(clock5.liveTimers())}`);
++
++  // I3.6 Снятие сигнала во время задержки: чанк не выдаётся, чтение отклоняется AbortError
++  const st6 = {};
++  const clock6 = makeClock();
++  const hub6 = makeAbortHub(() => clock6.now());
++  const ctrl6 = new hub6.AbortController();
++  const s6 = makeStream(bytes, { chunkSize: 1000, delayChunks: 500, clock: clock6, signal: ctrl6.signal }, st6);
++  const r6 = s6.getReader();
++  const planned6 = r6.read();
++  expect(st6.delivered === undefined, 'delivered вырос до фактической выдачи чанка');
++  ctrl6.abort('body_idle_timeout');
++  const out6 = await settleWithin(planned6, clock6, 5000, 1000);
++  expect(out6.state === 'rejected' && out6.error.name === 'AbortError', `отложенный чанк не отклонён по сигналу: ${out6.state}`);
++  expect(st6.delivered === undefined && st6.delayedChunksDropped === 1 && st6.readRejectsAbort === 1, `учёт чанка, отменённого по сигналу: ${JSON.stringify(st6)}`);
++  expect(st6.droppedChunkBytes === 1000 && st6.droppedChunkWhy === 'signal_abort', `байты отменённого чанка: ${st6.droppedChunkBytes} (${st6.droppedChunkWhy})`);
++  expect(clock6.live() === 0, `после отмены сигнала на часах остался таймер чанка: ${JSON.stringify(clock6.liveTimers())}`);
+ });
+ 
+ test('I4', 'инфраструктура: четыре режима cancel() и отсутствие необработанных отклонений', async () => {
+@@ -1390,18 +1549,33 @@ test('I4', 'инфраструктура: четыре режима cancel() и
+   expect(threw !== null && /fixture_cancel_sync_throw/.test(threw.message), `синхронный выброс cancel(): ${describeReason(threw)}`);
+   expect(d.cancelThrows === 1, `счётчик выбросов cancel(): ${d.cancelThrows ?? 0}`);
+ 
+-  // I4.5 cancel() отклоняет зависший read(): необработанного отклонения не остаётся
++  // I4.5 Обычный cancel() закрывает поток, а не отклоняет чтение: зависшее read() завершается
++  // done без данных, последующие чтения тоже done без данных, AbortError не появляется.
+   const e2 = {};
+   const se = makeStream(bytes, { chunkSize: 100, clock, stallAfter: 0, cancelMode: 'never' }, e2);
+   const re = se.getReader();
+   const hangRead = re.read();
+   const hangWatch = settleWithin(hangRead, clock, 10000, 1000);
+-  const cs = se.cancel('cancel_отклоняет_read');
++  const cs = se.cancel('discardBody');
+   out = await settleWithin(hangRead, clock, 2000, 1000);
+-  expect(out.state === 'rejected', `cancel() не отклонил зависший read(): ${out.state}`);
+-  expect(e2.readRejectsAbort === 1, `счётчик отклонённых read(): ${e2.readRejectsAbort ?? 0}`);
++  expect(out.state === 'ok' && out.value.done === true && out.value.value === undefined, `cancel() не завершил зависшее чтение как done: ${out.state}`);
++  expect(e2.pendingReadsClosed === 1 && e2.readRejectsAbort === undefined, `семантика cancel() смешана с отменой сигнала: ${JSON.stringify(e2)}`);
+   const watch = await hangWatch;
+-  expect(watch.state === 'rejected', `наблюдатель зависшего read(): ${watch.state}`);
++  expect(watch.state === 'ok', `наблюдатель зависшего read(): ${watch.state}`);
++
++  // I4.6 Чтение после cancel() не отдаёт данных: отменённый поток не может «догнать» чанки
++  const e3 = {};
++  const sc2 = makeStream(bytes, { chunkSize: 100, clock }, e3);
++  const re3 = sc2.getReader();
++  const first = await re3.read();
++  expect(first.done === false && first.value.byteLength === 100, `первое чтение: ${JSON.stringify(first.done)}`);
++  sc2.cancel('over_limit');
++  expect(e3.delivered === 100, `delivered после отмены: ${e3.delivered}`);
++  let after = await re3.read();
++  expect(after.done === true && after.value === undefined, `чтение после cancel() вернуло данные: ${after.done}`);
++  after = await sc2.getReader().read();
++  expect(after.done === true && after.value === undefined, 'второй читатель отменённого потока получил данные');
++  expect(e3.delivered === 100 && e3.readsAfterCancel === 2, `учёт чтений после отмены: ${JSON.stringify(e3)}`);
+   void cs;
+   expect(rejectionList.length === 0, `после тестов отмены есть необработанные отклонения: ${rejectionList.map((r) => `${r.test}: ${r.text}`).join('; ')}`);
+ });
+@@ -1420,6 +1594,113 @@ test('I5', 'инфраструктура: детектор необработа
+   expect(rejectionList.length === 0, `вне окна перехвачено: ${rejectionList.map((r) => `${r.test}: ${r.text}`).join('; ')}`);
+ });
+ 
++test('I6', 'инфраструктура: слушатели AbortSignal снимаются по завершении операции', async () => {
++  // I6.1 Полный прогон зонда: слушатели навешивались, и к концу прогона не осталось ни одного
++  const env = makeEnv({ routes: { bytes: () => bytesFixture({}, {}) } });
++  await runProbe(env, [PATCH.cdn(['cdn.test.invalid'])]);
++  expect(env.abort.hub.listenersAdded > 0, 'слушатели abort вообще не навешивались');
++  expect(env.abort.hub.listenersRemoved === env.abort.hub.listenersAdded, `снято ${env.abort.hub.listenersRemoved} слушателей из ${env.abort.hub.listenersAdded}`);
++  expect(env.abort.hub.liveListeners() === 0, `живых слушателей abort после прогона: ${env.abort.hub.liveListeners()}`);
++
++  // I6.2 Зависающий запрос: во время зависания слушатель ровно один, после завершения снят
++  const env2 = makeEnv({ routes: { conversation: () => ({ __hangUntilAbort: true }) } });
++  const ctrl = new env2.AbortController();
++  const hanging = env2.fetch('https://chatgpt.com/backend-api/conversation/conv_uuid_0', { signal: ctrl.signal });
++  let out = await settleWithin(hanging, env2.clock, 2000, 1000);
++  expect(out.state === 'pending', `зависающий запрос завершился сам: ${out.state}`);
++  // во время зависания висят ровно два слушателя: учёт журнала запроса и ожидание отмены
++  expect(env2.abort.hub.liveListeners() === 2, `во время зависания живых слушателей ${env2.abort.hub.liveListeners()}, ожидалось 2`);
++  ctrl.abort('operator_stop');
++  out = await settleWithin(hanging, env2.clock, 1000, 500);
++  expect(out.state === 'rejected', `запрос не отклонён по отмене: ${out.state}`);
++  expect(env2.abort.hub.liveListeners() === 0, `после завершения отменённого запроса живых слушателей ${env2.abort.hub.liveListeners()}`);
++
++  // I6.3 Поток закрывается дочитыванием: слушатель снят
++  const clock = makeClock();
++  const bytes = new Uint8Array(300).fill(69);
++  const ab = makeAbortHub(() => clock.now());
++  const hub = ab.hub;
++  const c1 = new ab.AbortController();
++  const s1 = makeStream(bytes, { chunkSize: 300, clock, signal: c1.signal }, {});
++  const r1 = s1.getReader();
++  expect(hub.liveListeners() === 1, `слушателей потока ${hub.liveListeners()}, ожидался 1`);
++  await r1.read();
++  const end1 = await r1.read();
++  expect(end1.done === true, 'поток не дочитан до конца');
++  expect(hub.liveListeners() === 0, `слушатель не снят после дочитывания потока: ${hub.liveListeners()}`);
++
++  // I6.4 cancel() потока снимает слушатель (путь discardBody и отбраковки по лимиту)
++  const st4 = {};
++  const c4 = new ab.AbortController();
++  const s4 = makeStream(bytes, { chunkSize: 100, clock, signal: c4.signal }, st4);
++  s4.getReader();
++  s4.cancel('discard_body');
++  expect(st4.signalListenersDetached === 1 && hub.liveListeners() === 0, `cancel() не снял слушатель: ${JSON.stringify(st4)}, живых ${hub.liveListeners()}`);
++
++  // I6.5 Отмена сигнала при зависшем чтении: слушатель снят, чтение отклонено
++  const st5 = {};
++  const c5 = new ab.AbortController();
++  const s5 = makeStream(bytes, { chunkSize: 100, clock, signal: c5.signal, stallAfter: 1 }, st5);
++  const r5 = s5.getReader();
++  await r5.read();
++  const stalled = r5.read();
++  expect(hub.liveListeners() === 1, `до отмены живых слушателей ${hub.liveListeners()}`);
++  c5.abort('body_idle_timeout');
++  const out5 = await settleWithin(stalled, clock, 1000, 500);
++  expect(out5.state === 'rejected' && out5.error.name === 'AbortError', `зависшее чтение не отклонено: ${out5.state}`);
++  expect(st5.signalListenersDetached === 1 && hub.liveListeners() === 0, `отмена сигнала не сняла слушатель: ${JSON.stringify(st5)}, живых ${hub.liveListeners()}`);
++});
++
++test('I7', 'инфраструктура: closed отражает закрытие потока, а не завершение промиса отмены', async () => {
++  const clock = makeClock();
++  const bytes = new Uint8Array(400).fill(70);
++
++  // I7.1 cancelMode never: поток закрыт сразу, промис cancel() не завершается никогда
++  const a = {};
++  const sa = makeStream(bytes, { chunkSize: 100, clock, cancelMode: 'never' }, a);
++  const cancelPromise = sa.cancel('never_cancel');
++  let out = await settleWithin(sa.closed, clock, 3000, 1000);
++  expect(out.state === 'ok', `closed не закрылся при инициированной отмене: ${out.state}`);
++  expect(a.closedState === 'cancelled' && a.closedResolved === 1, `состояние закрытия: ${JSON.stringify(a)}`);
++  out = await settleWithin(cancelPromise, clock, 5000, 1000);
++  expect(out.state === 'pending', 'промис cancel() в режиме never завершился');
++  void cancelPromise;
++
++  // I7.2 cancelMode delayed: closed не ждёт завершения underlying cancel()
++  const b = {};
++  const sb = makeStream(bytes, { chunkSize: 100, clock, cancelMode: 'delayed', cancelDelayMs: 400 }, b);
++  const cb = sb.getReader().cancel('delayed_cancel');
++  out = await settleWithin(sb.closed, clock, 200, 100);
++  expect(out.state === 'ok' && b.cancelSettled === undefined, `closed дождался underlying cancel(): ${JSON.stringify(b)}`);
++  out = await settleWithin(cb, clock, 2000, 100);
++  expect(out.state === 'ok' && b.cancelSettled === 1, `отложенная отмена не завершилась: ${JSON.stringify(b)}`);
++
++  // I7.3 Обычное чтение до конца: closed закрывается только после done
++  const c = {};
++  const sc = makeStream(bytes, { chunkSize: 400, clock }, c);
++  const rc = sc.getReader();
++  await rc.read();
++  out = await settleWithin(rc.closed, clock, 200, 100);
++  expect(out.state === 'pending', 'closed закрылся раньше конца потока');
++  const last = await rc.read();
++  expect(last.done === true, 'поток не завершился');
++  out = await settleWithin(rc.closed, clock, 200, 100);
++  expect(out.state === 'ok' && c.closedState === 'closed', `closed после полного чтения: ${JSON.stringify(c)}`);
++
++  // I7.4 syncThrow: поток закрыт с ошибкой, необработанного отклонения не возникает
++  const d = {};
++  const sd = makeStream(bytes, { chunkSize: 100, clock, cancelMode: 'syncThrow' }, d);
++  const rd = sd.getReader();
++  let threw = null;
++  try { rd.cancel('sync_throw'); } catch (e) { threw = e; }
++  expect(threw !== null && /fixture_cancel_sync_throw/.test(threw.message), `синхронный выброс cancel(): ${describeReason(threw)}`);
++  out = await settleWithin(sd.closed, clock, 1000, 500);
++  expect(out.state === 'rejected', `closed при выбросе cancel() не отклонён: ${out.state}`);
++  expect(d.closedState === 'errored' && d.cancelThrows === 1, `состояние закрытия: ${JSON.stringify(d)}`);
++  await nextMacrotasks(2);
++  expect(rejectionList.length === 0, `отклонение closed породило необработанное отклонение: ${rejectionList.map((r) => `${r.test}: ${r.text}`).join('; ')}`);
++});
++
+ // ---------- запуск ----------
+ const want = process.argv.slice(2);
+ for (const t of tests.sort((a, b) => a.id.localeCompare(b.id))) {
