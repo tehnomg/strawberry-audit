@@ -1,0 +1,496 @@
+diff --git "a/C:\\Users\\User\\AppData\\Local\\Temp\\s2base\\probe_a2_tests.mjs" b/probe_a2_tests.mjs
+index 06e49e0..db9252e 100644
+--- "a/C:\\Users\\User\\AppData\\Local\\Temp\\s2base\\probe_a2_tests.mjs"
++++ b/probe_a2_tests.mjs
+@@ -24,6 +24,10 @@ export const ASSET_ID_RE = /\bfile_[0-9a-f]{16,}\b/i;
+ // Блок нужен, чтобы будущие проверки таймаутов и отмены потоков были конечными и
+ // наблюдаемыми: время идёт по виртуальным часам, поведение потоков и отмен задаёт тест,
+ // а необработанное отклонение промиса считается ошибкой всего набора, а не деталью фона.
++// Этап 2 A-2a добавил общий журнал событий среды env.events: 'abort' (снятие сигнала),
++// 'readReject' (отклонение чтения по сигналу) и 'cancel' (обращение к отмене потока).
++// По порядку этих записей проверяется требование П.4: сначала abort() запроса, потом
++// ограниченная по времени отмена потока.
+ 
+ export function abortErrorStable(text = 'операция прервана') {
+   const e = new Error(text);
+@@ -100,6 +104,10 @@ export const nextMacrotasks = (n = 3) => new Promise((resolve) => {
+ // Ждём промис только по виртуальным часам: передвигаем часы шагами и разгребаем очередь
+ // обещаний, пока операция не завершится или пока виртуальный лимит не исчерпается.
+ // state: 'ok' | 'rejected' | 'pending'. pending — это находка («операция висит»), а не успех.
++// Каждый шаг отдаёт управление реальному циклу событий (один макротик): нативные асинхронные
++// вызовы вроде crypto.subtle.digest завершаются только на реальном витке. Виртуальное время
++// при этом не продвигается, так что «операция не завершилась за N мс» по-прежнему означает
++// именно виртуальные N мс.
+ export async function settleWithin(promise, clock, limitMs = 60000, stepMs = 500) {
+   let outcome = { state: 'pending' };
+   Promise.resolve(promise).then(
+@@ -110,6 +118,8 @@ export async function settleWithin(promise, clock, limitMs = 60000, stepMs = 500
+   while (outcome.state === 'pending' && spent < limitMs) {
+     await drainMicrotasks(30);
+     if (outcome.state !== 'pending') break;
++    await nextMacrotasks(1);
++    if (outcome.state !== 'pending') break;
+     clock.advanceBy(stepMs);
+     spent += stepMs;
+   }
+@@ -120,7 +130,9 @@ export async function settleWithin(promise, clock, limitMs = 60000, stepMs = 500
+ // Управляемый AbortController: видно, сколько контроллеров создано, сколько раз вызван
+ // abort(), с какой причиной, сколько слушателей навешано и сколько ещё живых. Повторный
+ // abort() счётчик отмен не удваивает. Живые слушатели — это индикатор утечки фикстуры.
+-export function makeAbortHub(getNow = () => 0) {
++// journal (общий журнал среды) получает запись 'abort' — нужен для проверки порядка
++// освобождения ресурсов: abort запроса предшествует отмене потока (П.4).
++export function makeAbortHub(getNow = () => 0, journal = null) {
+   const hub = { created: 0, aborts: [], signals: 0, listenersAdded: 0, listenersRemoved: 0, signalList: [] };
+   class AbortSignalStable {
+     constructor() {
+@@ -159,6 +171,7 @@ export function makeAbortHub(getNow = () => 0) {
+       sig.aborted = true;
+       sig.reason = r;
+       hub.aborts.push({ atMs: getNow(), reasonText: describeReason(r), signal: sig, listeners: sig._listeners.length });
++      if (journal) journal.push({ kind: 'abort', atMs: getNow(), reasonText: describeReason(r) });
+       if (typeof sig.onabort === 'function') {
+         try { sig.onabort({ type: 'abort', target: sig }); } catch { /* слушатель не ломает отмену */ }
+       }
+@@ -201,6 +214,9 @@ export function makeAbortHub(getNow = () => 0) {
+ // readRejectsAbort, pendingReadsClosed, readsAfterCancel, delayedChunksScheduled/
+ // Delivered/Dropped, cancelSettled, cancelThrows, closedState, signalListenersDetached,
+ // getReaderCalls, getReaderWhileLocked, releaseLocks.
++// opts.journal — общий журнал событий среды: поток пишет в него 'readReject' (чтение
++// отклонено по сигналу) и 'cancel' (поступила отмена потока); вместе с записями 'abort'
++// из AbortController это даёт наблюдаемый порядок освобождения ресурсов (П.4).
+ export function makeStream(bytes, opts = {}, stats = {}) {
+   const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+   const total = view.byteLength;
+@@ -208,6 +224,11 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+   const cancelMode = opts.cancelMode ?? 'immediate';
+   const cancelDelayMs = opts.cancelDelayMs ?? 1000;
+   const clock = opts.clock ?? null;
++  const journal = Array.isArray(opts.journal) ? opts.journal : null;
++  const logEvent = (kind, extra = {}) => {
++    if (!journal) return;
++    journal.push({ kind, atMs: clock ? clock.now() : null, ...extra });
++  };
+   const failWith = typeof opts.failWith === 'function' ? opts.failWith : () => new Error('fixture_stream_break');
+   const bump = (key, by = 1) => { stats[key] = (stats[key] ?? 0) + by; };
+   let pos = 0;
+@@ -244,6 +265,7 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+     pendingRead = null;
+     p.reject(abortErrorStable(reasonText));
+     bump('readRejectsAbort');
++    logEvent('readReject', { via: 'stalled_read', reasonText });
+     return true;
+   };
+   // Обычный cancel(): поток закрывается, ожидающее чтение завершается как done без данных.
+@@ -265,6 +287,7 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+     stats.droppedChunkWhy = why;
+     if (why === 'signal_abort') {
+       bump('readRejectsAbort');
++      logEvent('readReject', { via: 'delayed_chunk', reasonText: reasonText || 'поток прерван сигналом' });
+       pc.reject(abortErrorStable(reasonText || 'поток прерван сигналом во время задержки чанка'));
+     } else {
+       bump('doneReads');
+@@ -301,6 +324,7 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+     }
+     if (signal && signal.aborted) {
+       bump('readRejectsAbort');
++      logEvent('readReject', { via: 'deliver', reasonText: `поток прерван сигналом: ${describeReason(signal.reason)}` });
+       if (viaDelay) bump('delayedChunksDropped');
+       reject(abortErrorStable(`поток прерван сигналом: ${describeReason(signal.reason)}`));
+       return;
+@@ -318,6 +342,7 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+     if (pendingChunk) bump('concurrentReads');
+     if (signal && signal.aborted) {
+       bump('readRejectsAbort');
++      logEvent('readReject', { via: 'read_start', reasonText: `поток прерван сигналом: ${describeReason(signal.reason)}` });
+       return Promise.reject(abortErrorStable(`поток прерван сигналом: ${describeReason(signal.reason)}`));
+     }
+     if (cancelled) {
+@@ -390,6 +415,7 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+     // ошибка настройки фикстуры, а не поведение потока: бросаем сразу и до изменения состояния
+     if (cancelMode === 'delayed' && !clock) throw new Error('cancelMode delayed требует виртуальные часы clock в makeStream');
+     bump('cancels');
++    logEvent('cancel', { mode: cancelMode, reasonText: describeReason(reason) });
+     stats.cancelReason = reason;
+     stats.cancelMode = cancelMode;
+     stats.chunksGivenAtCancel = chunksGiven;
+@@ -482,7 +508,9 @@ export function makeEnv({ location, routes = {}, domExtra = {}, page = {} } = {}
+   const calls = [];
+   const clock = makeClock();
+   const timers = clock.registered;
+-  const abort = makeAbortHub(() => clock.now());
++  // Общий журнал событий: отмены сигналов и обращения к отмене потоков в порядке их начала.
++  const events = [];
++  const abort = makeAbortHub(() => clock.now(), events);
+   const hangings = [];
+   const streamsSeen = [];
+   const logs = [];
+@@ -633,7 +661,7 @@ export function makeEnv({ location, routes = {}, domExtra = {}, page = {} } = {}
+     // Таймеры зонда живут на виртуальных часах: срабатывают только когда тест сам двигает время.
+     setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+     clock, abort, AbortController: abort.AbortController, AbortSignal: abort.AbortSignal,
+-    hangings, streamsSeen,
++    hangings, streamsSeen, events,
+     URL: URLStable, Blob: class Blob { constructor() {} }, crypto: globalThis.crypto,
+   };
+ }
+@@ -666,8 +694,91 @@ export const PATCH = {
+   diagIds: ['const DIAGNOSTIC_IDS = false;', 'const DIAGNOSTIC_IDS = true;'],
+   linkCheck: ['const LINK_LIFETIME_CHECK = false;', 'const LINK_LIFETIME_CHECK = true;'],
+   jsonLimit: (n) => ['const MAX_JSON_BYTES = 4 * 1024 * 1024;', `const MAX_JSON_BYTES = ${n};`],
++  // Таймауты чтения тела (этап 2 задачи A-2a): значения подменяются, чтобы сценарии зависания
++  // и медленного канала были конечными и проверяемыми на виртуальных часах. Якорь обязан
++  // совпасть с исходником: иначе тест падает, а не проверяет неизвестно что.
++  apiBodyIdle: (n) => ['const API_BODY_IDLE_TIMEOUT_MS = 15000;', `const API_BODY_IDLE_TIMEOUT_MS = ${n};`],
++  dlBodyIdle: (n) => ['const DOWNLOAD_BODY_IDLE_TIMEOUT_MS = 60000;', `const DOWNLOAD_BODY_IDLE_TIMEOUT_MS = ${n};`],
++  apiBodyTotal: (n) => ['const API_BODY_TOTAL_TIMEOUT_MS = 90000;', `const API_BODY_TOTAL_TIMEOUT_MS = ${n};`],
++  bodyFloor: (n) => ['const BODY_TOTAL_FLOOR_MS = 120000;', `const BODY_TOTAL_FLOOR_MS = ${n};`],
++  bodyCeiling: (n) => ['const BODY_TOTAL_CEILING_MS = 900000;', `const BODY_TOTAL_CEILING_MS = ${n};`],
++  cancelTimeout: (n) => ['const CANCEL_TIMEOUT_MS = 1000;', `const CANCEL_TIMEOUT_MS = ${n};`],
++  // AbortController недоступен: прогон обязан остановиться до первого запроса (П.2)
++  noAbortController: ["const abortSupported = typeof AbortController === 'function';", 'const abortSupported = false;'],
+ };
+ 
++// ---------- проверки, общие для нескольких тестов ----------
++// Значения таймаутов читаются из исходника зонда: тест обязан следить за кодом, а не за памятью
++// автора теста. Все константы обязаны быть заданы явными числами (иначе тест 10.1 ловит паузу).
++export function probeTimeoutConstants(src = SRC) {
++  const num = (name) => Number((src.match(new RegExp(`const ${name} = (\\d+);`)) || [])[1]);
++  const expr = (name) => {
++    const m = src.match(new RegExp(`const ${name} = ([0-9 *]+);`));
++    return m ? Function(`"use strict"; return (${m[1]});`)() : NaN;
++  };
++  return {
++    apiHead: num('API_HEAD_TIMEOUT_MS'),
++    dlHead: num('DOWNLOAD_HEAD_TIMEOUT_MS'),
++    apiIdle: num('API_BODY_IDLE_TIMEOUT_MS'),
++    dlIdle: num('DOWNLOAD_BODY_IDLE_TIMEOUT_MS'),
++    apiTotal: num('API_BODY_TOTAL_TIMEOUT_MS'),
++    floor: num('BODY_TOTAL_FLOOR_MS'),
++    ceiling: num('BODY_TOTAL_CEILING_MS'),
++    minBps: num('MIN_THROUGHPUT_BPS'),
++    cancel: num('CANCEL_TIMEOUT_MS'),
++    fileLimitBytes: expr('MAX_BYTES_PER_FILE'),
++  };
++}
++// Общий срок чтения файла по формуле §2.1: из остатка бюджета и минимальной допустимой скорости.
++export const fileTotalTimeoutMs = (c, room) =>
++  Math.min(c.ceiling, Math.max(c.floor, Math.ceil((Math.max(0, room) * 8 * 1000) / c.minBps)));
++
++// Текст функции зонда по имени — для адресных статических проверок (где именно разрешено
++// вызывать getReader и fetch). Поиск идёт по объявлению const <имя> = ... и закрывающей скобке
++// того же блока; для функций с телом без фигурных скобок внутри проверка не используется.
++export function probeFnBody(src, name) {
++  const start = src.indexOf(`const ${name} = `);
++  if (start < 0) return null;
++  // Тело начинается после стрелки объявления: фигурные скобки значений по умолчанию
++  // в параметрах (options = {}) телом не являются.
++  const arrow = src.indexOf('=>', start);
++  const open = src.indexOf('{', arrow < 0 ? start : arrow);
++  if (open < 0) return null;
++  let depth = 0;
++  for (let i = open; i < src.length; i += 1) {
++    if (src[i] === '{') depth += 1;
++    else if (src[i] === '}') {
++      depth -= 1;
++      if (depth === 0) return src.slice(start, i + 1);
++    }
++  }
++  return null;
++}
++
++// Инвариант шлюза (П.2): каждое обращение к сети зарегистрировано счётчиком зонда. Если
++// появится обход netSend, счётчики разойдутся.
++export function assertGatewayCounted(rep, env, label) {
++  expect(rep.requests.total === env.calls.length, `${label}: requests.total ${rep.requests.total} != обращений fetch ${env.calls.length}`);
++  expect(env.calls.every((c) => c.hasSignal), `${label}: есть обращение без AbortSignal`);
++}
++
++// После завершившейся операции живых таймеров обращения быть не должно (F-2). Единственный
++// допустимый живой таймер в конце прогона — отзыв URL отчёта (2000 мс), он не сетевой.
++export function assertNoLiveTimeouts(env, label, timeoutMinMs = 10000) {
++  const live = env.clock.liveTimers();
++  const bad = live.filter((t) => t.delay >= timeoutMinMs);
++  expect(bad.length === 0, `${label}: после прогона остались живые таймеры обращения: ${JSON.stringify(bad)}`);
++  env.clock.advanceBy(timeoutMinMs); // добиваем не сетевые короткие таймеры отчёта
++  expect(env.clock.live() === 0, `${label}: живых таймеров после добивания часов: ${env.clock.live()}`);
++}
++
++// Порядок освобождения ресурсов по журналу среды (П.4): abort() запроса, отклонение чтения
++// по сигналу, затем отмена потока. Возвращает последовательность родов событий строкой.
++export const eventSeq = (env) => env.events.map((e) => e.kind).join(',');
++// Ожидаемая последовательность из count одинаковых групп событий (разделитель — запятая,
++// как в журнале; простое repeat() групп не разделяет, поэтому сборка через join).
++export const repeatSeq = (unit, count) => new Array(count).fill(unit).join(',');
++
+ export async function runProbe(env, patches = []) {
+   const names = ['location', 'document', 'fetch', 'console', 'performance', 'setTimeout', 'clearTimeout', 'AbortController', 'URL', 'Blob', 'crypto'];
+   let src = SRC;
+@@ -738,6 +849,21 @@ test('01', 'статические гарантии: нет cookie, include, н
+   if (/\b(POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/.test(SRC.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''))) bad.push('негет-метод');
+   if (/READ_DEVICE_COOKIE/.test(SRC)) bad.push('READ_DEVICE_COOKIE');
+   if (/bodySample/.test(SRC)) bad.push('bodySample');
++  // Единая точка сети (П.2): ровно один вызов fetch, и он внутри netSend. Обходного пути
++  // «fetch без AbortController» быть не должно — иначе на него не распространяется ни один таймер.
++  const code = SRC.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
++  const fetchSites = (code.match(/\bfetch\s*\(/g) ?? []).length;
++  if (fetchSites !== 1) bad.push(`мест вызова fetch: ${fetchSites} (ожидался один — в netSend)`);
++  const netBody = probeFnBody(SRC, 'netSend') ?? '';
++  if (!/\bfetch\s*\(/.test(netBody)) bad.push('единственный вызов fetch не внутри netSend');
++  if (!/const netSend = async \(/.test(SRC) || (SRC.match(/await netSend\(/g) ?? []).length !== 1) bad.push('шлюз netSend не единственный путь к fetch');
++  // getReader разрешён только в readCapped (чтение) и в discardBody (закрытие отброшенного тела)
++  const readerSites = (code.match(/\.getReader\s*\(/g) ?? []).length;
++  if (readerSites !== 2) bad.push(`мест getReader: ${readerSites} (ожидалось два)`);
++  const outsideReaders = ['readCapped', 'discardBody'].reduce((acc, name) => acc - ((probeFnBody(SRC, name) ?? '').match(/\.getReader\s*\(/g) ?? []).length, readerSites);
++  if (outsideReaders !== 0) bad.push(`getReader вне readCapped/discardBody: ${outsideReaders}`);
++  // Тело ответа не читается целиком ни одним из методов Response
++  if (/\.(arrayBuffer|blob|text|json)\s*\(\s*\)/.test(code)) bad.push('целиковое чтение тела');
+   expect(bad.length === 0, bad.join(', '));
+ });
+ 
+@@ -835,6 +961,14 @@ test('05', 'контекст: чужой hostname / http / share -> отказ 
+   expect(envNoTok.calls.length === 0, `без токена выполнено запросов ${envNoTok.calls.length}`);
+   expect(/no_auth_token/.test(JSON.stringify(repNoTok.context ?? {})), 'нет причины no_auth_token');
+ 
++  // 5.4 AbortController недоступен: прогон не начинается (П.2). Прежний обходной путь
++  // «fetch без сигнала» убран, потому что без сигнала нельзя прервать ни одну фазу.
++  const envNoAbort = makeEnv();
++  const repNoAbort = await runProbe(envNoAbort, [PATCH.noAbortController]);
++  expect(repNoAbort.context?.status === 'INVALID_CONTEXT', `контекст без AbortController: ${JSON.stringify(repNoAbort.context)}`);
++  expect((repNoAbort.context?.issues ?? []).includes('abort_controller_missing'), `причины отказа: ${JSON.stringify(repNoAbort.context?.issues)}`);
++  expect(envNoAbort.calls.length === 0 && repNoAbort.requests.total === 0, `обращения всё равно ушли: fetch ${envNoAbort.calls.length}, счётчик ${repNoAbort.requests.total}`);
++
+   // 5.4 корректный контекст фиксируется в отчёте, запросы идут
+   const envOk = makeEnv();
+   const repOk = await runProbe(envOk);
+@@ -1073,13 +1207,25 @@ test('10', 'повторная загрузка выключена по умол
+   expect(new Set(urls).size === urls.length, `повторный запрос байтов: ${urls.length - new Set(urls).size}`);
+   expect(rep.linkLifetimeCheck?.enabled === false, 'режим проверки живости ссылки включён по умолчанию');
+   expect((rep.linkLifetimeCheck?.results ?? []).length === 0, 'в обычном прогоне есть результаты второй фазы');
+-  // Длительные таймеры допустимы только как таймауты ожидания ответа: они прерывают запрос,
+-  // а не создают паузу. Значения берутся из самого зонда, чтобы тест не разъехался с кодом.
+-  const apiTimeout = Number((SRC.match(/const API_HEAD_TIMEOUT_MS = (\d+)/) || [])[1]);
+-  const dlTimeout = Number((SRC.match(/const DOWNLOAD_HEAD_TIMEOUT_MS = (\d+)/) || [])[1]);
+-  expect(apiTimeout > 0 && dlTimeout > 0, 'в зонде не заданы таймауты ожидания ответа (этап 16)');
+-  const bigTimers = env.timers.filter((t) => t >= 10000 && t !== apiTimeout && t !== dlTimeout);
+-  expect(bigTimers.length === 0, `пауза ${bigTimers.join(',')} мс в обычном режиме`);
++  // Длительные таймеры допустимы только как таймауты обращения: они прерывают запрос, а не
++  // создают паузу. Набор допустимых значений собирается из констант самого зонда (§2.1), и
++  // дополнительно проверяется, что каждый такой таймер действительно выставлялся: произвольным
++  // расширением диапазона проверка не ослабляется.
++  const tmo = probeTimeoutConstants(SRC);
++  expect(tmo.apiHead > 0 && tmo.dlHead > 0, 'в зонде не заданы таймауты ожидания ответа (этап 16)');
++  expect(tmo.apiIdle > 0 && tmo.dlIdle > 0 && tmo.apiTotal > 0 && tmo.floor > 0 && tmo.ceiling > 0 && tmo.minBps > 0 && tmo.cancel > 0,
++    `в зонде не заданы таймауты чтения тела и ожидания отмены потока (этап 2 A-2a): ${JSON.stringify(tmo)}`);
++  // Общий срок чтения файла при полном лимите на файл считается по формуле §2.1:
++  // min(потолок, max(низ, объём·8·1000 / минимальная скорость)).
++  const fileTotal = fileTotalTimeoutMs(tmo, tmo.fileLimitBytes);
++  const allowed = new Set([tmo.apiHead, tmo.dlHead, tmo.apiIdle, tmo.dlIdle, tmo.apiTotal, fileTotal]);
++  const unknownTimers = [...new Set(env.timers.filter((t) => t >= 10000 && !allowed.has(t)))];
++  expect(unknownTimers.length === 0, `неизвестный длительный таймер ${unknownTimers.join(',')} мс в обычном режиме`);
++  for (const name of ['apiHead', 'dlHead', 'apiIdle', 'dlIdle', 'apiTotal']) {
++    expect(env.timers.includes(tmo[name]), `таймер обращения ${name}=${tmo[name]} мс не регистрировался виртуальными часами`);
++  }
++  expect(env.timers.includes(fileTotal), `общий срок чтения файла ${fileTotal} мс по формуле §2.1 не регистрировался виртуальными часами`);
++  assertGatewayCounted(rep, env, '10.1');
+   const litTimers = [...SRC.matchAll(/setTimeout\([^)]*,\s*(\d+)\s*\)/g)].map((m) => Number(m[2])).filter((n) => n >= 10000);
+   expect(litTimers.length === 0, `в коде жёсткая пауза ${litTimers.join(',')} мс`);
+   const dump = JSON.stringify(rep);
+@@ -1364,6 +1510,197 @@ test('18', 'размер JSON-ответа и таймауты ожидания
+   expect(/new AbortController\(\)/.test(SRC), 'прерывание запроса не реализовано');
+   expect(rep.flags.MAX_JSON_BYTES > 0 && rep.flags.API_HEAD_TIMEOUT_MS > 0 && rep.flags.DOWNLOAD_HEAD_TIMEOUT_MS > 0, `флаги лимитов: ${JSON.stringify(rep.flags)}`);
+   expect(rep.abortControllerSupported === true, 'поддержка AbortController не зафиксирована в отчёте');
++  // 18.4 Таймауты чтения тела (этап 2 A-2a) заданы явно, видны в отчёте и не подменяются
++  // классификацией таймаута заголовков: в прогоне 18.2 причин чтения тела быть не должно.
++  for (const name of ['API_BODY_IDLE_TIMEOUT_MS', 'DOWNLOAD_BODY_IDLE_TIMEOUT_MS', 'API_BODY_TOTAL_TIMEOUT_MS', 'MIN_THROUGHPUT_BPS', 'BODY_TOTAL_FLOOR_MS', 'BODY_TOTAL_CEILING_MS', 'CANCEL_TIMEOUT_MS']) {
++    expect(rep.flags[name] > 0, `в отчёте нет флага лимита ${name}: ${JSON.stringify(rep.flags)}`);
++  }
++  for (const reason of ['body_idle_timeout', 'body_total_timeout']) {
++    expect(SRC.includes(`'${reason}'`), `в зонде нет причины отказа ${reason}`);
++  }
++  expect(!/body_idle_timeout|body_total_timeout/.test(JSON.stringify(rep)), 'таймаут ожидания заголовков помечен как таймаут чтения тела');
++  assertGatewayCounted(rep, env, '18.2');
++});
++
++// ---------- этап 2 задачи A-2a: чтение тела ответа не зависает (дефект F-2) ----------
++// Сценарии приёмки A3 и A7: сервер отдал заголовки и часть тела, дальше соединение молчит.
++// До этапа 2 такие операции не завершались никогда: таймер стоял только на ожидание заголовков
++// и снимался сразу после ответа. Проверяется не только статус, но и причина, учёт полученных
++// байтов, отсутствие sha256 при неполном теле, факт отмены запроса и попытки отменить поток,
++// порядок освобождения ресурсов, отсутствие живых таймеров и необработанных отклонений.
++
++test('19.1', 'F-2: зависшее тело загрузки обрывается по таймеру простоя', async () => {
++  const IDLE = 20000; // предел простоя увеличен: проверяем, что зонд берёт значение из константы
++  const CHUNK = 512;
++  const SIZE = CHUNK * 2; // заведомо меньше предела на файл (FL): отказ должен быть по простою, а не по объёму
++  const streamOpts = (e) => ({ stallAfter: 1, clock: e.clock, journal: e.events });
++  let env = null;
++  const st = {};
++  env = makeEnv({ routes: { bytes: () => bytesFixture({ body: bigBody(SIZE), contentLength: SIZE, chunkSize: CHUNK }, st, streamOpts(env)) } });
++  const patches = [PATCH.cdn(['cdn.test.invalid']), PATCH.chats, PATCH.extra, PATCH.fileLimit(FL), PATCH.dlBodyIdle(IDLE)];
++  const run = await settleWithin(runProbe(env, patches), env.clock, 400000, 500);
++  expect(run.state === 'ok', `прогон с зависшим телом не завершился: ${run.state} за ${run.spentMs} мс виртуального времени`);
++  const rep = run.value;
++  const assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
++  expect(assets.length > 0, 'нет ни одной записи о загрузке');
++  expect(assets.every((a) => a.bytes.status === 'NETWORK_ERROR' && a.bytes.reason === 'body_idle_timeout'), `классификация: ${JSON.stringify(assets.map((a) => [a.bytes.status, a.bytes.reason]))}`);
++  expect(assets.every((a) => a.bytes.timeout === true), 'признак таймаута не зафиксирован');
++  expect(assets.every((a) => a.bytes.receivedBytes === CHUNK), `учтено байтов: ${assets.map((a) => a.bytes.receivedBytes).join(', ')}, ожидалось по ${CHUNK}`);
++  expect(assets.every((a) => a.bytes.sha256 === undefined), 'неполное тело дало sha256');
++  expect(assets.every((a) => a.bytes.countedInTotals === false), 'зависшая загрузка помечена засчитанной');
++  expect(rep.downloaded.filesDownloaded === 0, 'зависшая загрузка засчитана как скачанная');
++  expect(rep.downloaded.bytesReadFromNetwork >= CHUNK * assets.length, 'байты зависшей загрузки не попали в лимит прогона');
++  // отмена запроса: ровно одна на обращение, причина — от таймера простоя, а не от кода чтения
++  expect(env.abort.hub.aborts.length === assets.length, `отмен запроса: ${env.abort.hub.aborts.length}, обращений к CDN: ${assets.length}`);
++  expect(env.abort.hub.aborts.every((a) => a.reasonText === 'body_idle_timeout'), `причины отмен: ${JSON.stringify(env.abort.hub.aborts.map((a) => a.reasonText))}`);
++  // попытка отменить поток зафиксирована и дошла до конца
++  expect(st.cancels === assets.length, `обращений к отмене потока: ${st.cancels ?? 0}, ожидалось ${assets.length}`);
++  expect(assets.every((a) => a.bytes.cancelSettled === true), `исход отмены потока: ${JSON.stringify(assets.map((a) => [a.bytes.cancelSettled, a.bytes.cancelMs]))}`);
++  expect(st.stalledReads === assets.length && st.readRejectsAbort === assets.length, `зависших чтений: ${st.stalledReads ?? 0}, отклонённых по сигналу: ${st.readRejectsAbort ?? 0}`);
++  expect(st.closedState === 'cancelled', `состояние потока после отказа: ${st.closedState}`);
++  // порядок освобождения ресурсов (П.4): abort запроса, отклонение чтения по сигналу, отмена потока
++  expect(eventSeq(env) === repeatSeq('abort,readReject,cancel', assets.length), `порядок освобождения ресурсов: ${eventSeq(env)}`);
++  assertNoLiveTimeouts(env, '19.1');
++  assertGatewayCounted(rep, env, '19.1');
++  expect(rejectionList.length === 0, `необработанных отклонений: ${JSON.stringify(rejectionList.slice(0, 2))}`);
++
++  // 19.1b Если сам поток не отвечает на cancel(), прогон всё равно завершается: ожидание отмены
++  // ограничено CANCEL_TIMEOUT_MS, а её исход зафиксирован как settled: false (П.4).
++  const TMO = probeTimeoutConstants(SRC);
++  let env2 = null;
++  const st2 = {};
++  env2 = makeEnv({ routes: { bytes: () => bytesFixture({ body: bigBody(SIZE), contentLength: SIZE, chunkSize: CHUNK }, st2, { ...streamOpts(env2), cancelMode: 'never' }) } });
++  const run2 = await settleWithin(runProbe(env2, patches), env2.clock, 400000, 500);
++  expect(run2.state === 'ok', `прогон с зависшей отменой потока не завершился: ${run2.state} за ${run2.spentMs} мс виртуального времени`);
++  const assets2 = run2.value.chats.flatMap((c) => c.assets).concat(run2.value.extraAssets ?? []).filter((a) => a.bytes);
++  expect(assets2.length === assets.length, `записей о загрузках: ${assets2.length}`);
++  expect(assets2.every((a) => a.bytes.reason === 'body_idle_timeout' && a.bytes.cancelSettled === false), `записи: ${JSON.stringify(assets2.map((a) => [a.bytes.reason, a.bytes.cancelSettled, a.bytes.cancelMs]))}`);
++  expect(env2.timers.includes(TMO.cancel), `предел ожидания отмены потока ${TMO.cancel} мс не выставлялся виртуальными часами`);
++  expect(st2.cancels === assets2.length, `попыток отменить поток: ${st2.cancels ?? 0}`);
++  expect(eventSeq(env2) === repeatSeq('abort,readReject,cancel', assets2.length), `порядок освобождения ресурсов: ${eventSeq(env2)}`);
++  assertNoLiveTimeouts(env2, '19.1b');
++  expect(rejectionList.length === 0, `необработанных отклонений: ${JSON.stringify(rejectionList.slice(0, 2))}`);
++});
++
++test('19.2', 'F-2: зависшее тело JSON обрывается по таймеру простоя, прогон продолжается', async () => {
++  const IDLE = 15000;
++  const CHUNK = 256; // jsonResponse отдаёт поток фикстуры чанками по 256 б
++  let env = null;
++  const st = {};
++  env = makeEnv({ routes: { conversation: () => jsonResponse(convFixture(0), { streamOpts: { stallAfter: 2, clock: env.clock, journal: env.events } }, st) } });
++  const run = await settleWithin(runProbe(env, [PATCH.chats, PATCH.extra, PATCH.apiBodyIdle(IDLE)]), env.clock, 400000, 500);
++  expect(run.state === 'ok', `прогон с зависшим JSON не завершился: ${run.state} за ${run.spentMs} мс виртуального времени`);
++  const rep = run.value;
++  // Число бесед в прогоне берём из отчёта: список бесед подменён PATCH.chats, плюс текущая вкладка.
++  const convStreams = rep.chats.length;
++  expect(convStreams >= 2, `чатов в отчёте: ${convStreams}: прогон не дошёл до остальных бесед`);
++  const reads = rep.chats.map((c) => c.fetch?.jsonRead);
++  expect(reads.every((j) => j && j.status === 'NETWORK_ERROR' && j.reason === 'body_idle_timeout'), `чтение JSON: ${JSON.stringify(reads)}`);
++  expect(reads.every((j) => j.receivedBytes === CHUNK * 2), `учтено байтов JSON: ${reads.map((j) => j.receivedBytes).join(', ')}, ожидалось ${CHUNK * 2}`);
++  const fullLen = new TextEncoder().encode(JSON.stringify(convFixture(0))).byteLength;
++  expect(reads.every((j) => j.declaredSize === fullLen), `заявленный размер JSON: ${reads.map((j) => j.declaredSize).join(', ')}, ожидалось ${fullLen}`);
++  expect(reads.every((j) => j.cancelSettled === true), `исход отмены потока: ${JSON.stringify(reads.map((j) => j.cancelSettled))}`);
++  expect(rep.chats.every((c) => c.fetch.status === 200), 'статус ответа потерян при таймауте тела');
++  expect(rep.chats.every((c) => (c.assets ?? []).length === 0), 'из оборванного JSON извлечены вложения');
++  expect(rep.aborted !== true, 'прогон прервался на зависшем JSON');
++  expect(st.cancels === convStreams && st.readRejectsAbort === convStreams, `отмена потока JSON: cancels=${st.cancels ?? 0}, отклонённых чтений=${st.readRejectsAbort ?? 0}`);
++  expect(env.abort.hub.aborts.length === convStreams && env.abort.hub.aborts.every((a) => a.reasonText === 'body_idle_timeout'), `причины отмен: ${JSON.stringify(env.abort.hub.aborts.map((a) => a.reasonText))}`);
++  expect(eventSeq(env) === repeatSeq('abort,readReject,cancel', convStreams), `порядок освобождения ресурсов: ${eventSeq(env)}`);
++  assertNoLiveTimeouts(env, '19.2');
++  assertGatewayCounted(rep, env, '19.2');
++});
++
++test('19.3', 'F-2: пауза короче предела простоя не прерывает загрузку', async () => {
++  const IDLE = 20000;
++  const PAUSE = 8000; // заведомо меньше предела простоя: чтение обязано продолжиться
++  const CHUNK = 512;
++  const SIZE = CHUNK * 3;
++  let env = null;
++  const st = {};
++  env = makeEnv({ routes: { bytes: () => bytesFixture({ body: bigBody(SIZE), contentLength: SIZE, chunkSize: CHUNK }, st, { delayChunks: [0, PAUSE, 0], clock: env.clock, journal: env.events }) } });
++  const run = await settleWithin(runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.chats, PATCH.extra, PATCH.fileLimit(FL), PATCH.dlBodyIdle(IDLE)]), env.clock, 400000, 500);
++  expect(run.state === 'ok', `прогон с паузой в теле не завершился: ${run.state} за ${run.spentMs} мс виртуального времени`);
++  const rep = run.value;
++  const assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
++  expect(assets.length > 0, 'нет записей о загрузках');
++  expect(assets.every((a) => a.bytes.status === 'OK'), `статусы: ${assets.map((a) => `${a.bytes.status}/${a.bytes.reason}`).join(', ')}`);
++  expect(assets.every((a) => a.bytes.sha256 && a.bytes.sizeBytes === SIZE), `неполное тело: ${assets.map((a) => a.bytes.sizeBytes).join(', ')}`);
++  expect(assets.every((a) => a.bytes.contentLengthMatchesActual === true), 'размер из content-length не сверен с фактическим');
++  expect(st.delayedChunksDelivered >= assets.length, 'задержанный чанок не был выдан потоком');
++  expect((st.delayedChunksDropped ?? 0) === 0, `задержанных чанков отброшено: ${st.delayedChunksDropped}`);
++  expect(env.abort.hub.created >= 1 && env.abort.hub.aborts.length === 0, `при паузе короче предела появились отмены: ${JSON.stringify(env.abort.hub.aborts.map((a) => a.reasonText))}`);
++  expect(env.events.length === 0, `при паузе короче предела появились отмены потока: ${eventSeq(env)}`);
++  assertNoLiveTimeouts(env, '19.3');
++  assertGatewayCounted(rep, env, '19.3');
++});
++
++test('20.1', 'F-2: медленное, но непрерывное чтение обрывается по общему предельному сроку', async () => {
++  // Нижний и верхний пределы ставятся равными, чтобы общий срок чтения файла не зависел от
++  // остатка бюджета и сравнение с ожиданием было точным. Чанки приходят чаще предела простоя,
++  // поэтому сработать должен именно предельный срок, а не простой. Интервал чанков кратен шагу
++  // виртуальных часов (500 мс), поэтому до срока 6500 мс приходит ровно 6 чанков.
++  const TOTAL = 6500;
++  const PAUSE = 1000;
++  const CHUNK = 512;
++  const chunksBeforeDeadline = Math.floor(TOTAL / PAUSE);
++  expect(chunksBeforeDeadline === 6, `арифметика теста: чанков до предельного срока ${chunksBeforeDeadline}`);
++  let env = null;
++  const st = {};
++  env = makeEnv({ routes: { bytes: () => bytesFixture({ body: bigBody(200000), contentLength: 0, chunkSize: CHUNK }, st, { delayChunks: PAUSE, clock: env.clock, journal: env.events }) } });
++  const run = await settleWithin(runProbe(env, [PATCH.cdn(['cdn.test.invalid']), PATCH.chats, PATCH.extra, PATCH.fileLimit(100000), PATCH.bodyFloor(TOTAL), PATCH.bodyCeiling(TOTAL)]), env.clock, 400000, 500);
++  expect(run.state === 'ok', `прогон с медленным телом не завершился: ${run.state} за ${run.spentMs} мс виртуального времени`);
++  const rep = run.value;
++  const assets = rep.chats.flatMap((c) => c.assets).concat(rep.extraAssets ?? []).filter((a) => a.bytes);
++  expect(assets.length > 0, 'нет записей о загрузках');
++  expect(assets.every((a) => a.bytes.status === 'NETWORK_ERROR' && a.bytes.reason === 'body_total_timeout'), `классификация: ${JSON.stringify(assets.map((a) => [a.bytes.status, a.bytes.reason]))}`);
++  expect(assets.every((a) => a.bytes.timeout === true), 'признак таймаута не зафиксирован');
++  expect(assets.every((a) => a.bytes.receivedBytes === chunksBeforeDeadline * CHUNK), `учтено байтов: ${assets.map((a) => a.bytes.receivedBytes).join(', ')}, ожидалось ${chunksBeforeDeadline * CHUNK}`);
++  expect(assets.every((a) => a.bytes.sha256 === undefined), 'неполное тело дало sha256');
++  expect(rep.downloaded.bytesReadFromNetwork >= chunksBeforeDeadline * CHUNK * assets.length, 'байты до остановки не учтены в лимите прогона');
++  expect(rep.downloaded.filesDownloaded === 0, 'прерванная по сроку загрузка засчитана как скачанная');
++  // простой не сработал: обрыв произошёл именно по общему сроку чтения
++  expect(env.abort.hub.aborts.length === assets.length, `отмен запроса: ${env.abort.hub.aborts.length}, обращений к CDN: ${assets.length}`);
++  expect(env.abort.hub.aborts.every((a) => a.reasonText === 'body_total_timeout'), `причины отмен: ${JSON.stringify(env.abort.hub.aborts.map((a) => a.reasonText))}`);
++  expect(st.cancels === assets.length && assets.every((a) => a.bytes.cancelSettled === true), `отмена потока: ${st.cancels ?? 0}`);
++  expect(eventSeq(env) === repeatSeq('abort,readReject,cancel', assets.length), `порядок освобождения ресурсов: ${eventSeq(env)}`);
++  assertNoLiveTimeouts(env, '20.1');
++  assertGatewayCounted(rep, env, '20.1');
++  expect(rejectionList.length === 0, `необработанных отклонений: ${JSON.stringify(rejectionList.slice(0, 2))}`);
++});
++
++test('20.2', 'F-2: общий предельный срок при чтении JSON-ответа', async () => {
++  const TOTAL = 4000;
++  // Пауза между чанками кратна шагу виртуальных часов (500 мс) и меньше предела простоя:
++  // моменты прихода чанков детерминированы, а сработать должен именно общий предельный срок.
++  const PAUSE = 1500;
++  const CHUNK = 256;
++  const chunksBeforeDeadline = Math.floor(TOTAL / PAUSE);
++  const fullLen = new TextEncoder().encode(JSON.stringify(convFixture(0))).byteLength;
++  expect(fullLen > chunksBeforeDeadline * CHUNK, `фикстура JSON (${fullLen} б) не длиннее ожидаемого неполного тела ${chunksBeforeDeadline * CHUNK} б`);
++  let env = null;
++  const st = {};
++  env = makeEnv({ routes: { conversation: () => jsonResponse(convFixture(0), { streamOpts: { delayChunks: PAUSE, clock: env.clock, journal: env.events } }, st) } });
++  const run = await settleWithin(runProbe(env, [PATCH.chats, PATCH.extra, PATCH.apiBodyTotal(TOTAL)]), env.clock, 400000, 500);
++  expect(run.state === 'ok', `прогон с медленным JSON не завершился: ${run.state} за ${run.spentMs} мс виртуального времени`);
++  const rep = run.value;
++  const convStreams = rep.chats.length;
++  expect(convStreams >= 2, `чатов в отчёте: ${convStreams}: прогон не продолжился после отказа`);
++  const reads = rep.chats.map((c) => c.fetch?.jsonRead);
++  expect(reads.every((j) => j && j.status === 'NETWORK_ERROR' && j.reason === 'body_total_timeout'), `чтение JSON: ${JSON.stringify(reads)}`);
++  for (const j of reads) {
++    expect(j.receivedBytes === chunksBeforeDeadline * CHUNK, `учтено байтов JSON: ${j.receivedBytes}, ожидалось ${chunksBeforeDeadline * CHUNK}`);
++    expect(j.receivedBytes < j.declaredSize && j.declaredSize === fullLen, `тело короче заявленного: ${j.receivedBytes} против ${j.declaredSize}`);
++    expect(j.limitBytes === 4 * 1024 * 1024, `предел чтения JSON в отчёте: ${j.limitBytes}`);
++    expect(j.cancelSettled === true, `исход отмены потока: ${j.cancelSettled}`);
++  }
++  expect(rep.chats.every((c) => (c.assets ?? []).length === 0), 'неполный JSON дал вложения');
++  expect(rep.aborted !== true, 'прогон прервался на предельном сроке чтения JSON');
++  expect(env.abort.hub.aborts.length === convStreams && env.abort.hub.aborts.every((a) => a.reasonText === 'body_total_timeout'), `причины отмен: ${JSON.stringify(env.abort.hub.aborts.map((a) => a.reasonText))}`);
++  expect(st.cancels === convStreams, `отмена потока JSON: ${st.cancels ?? 0}`);
++  expect((st.delayedChunksDropped ?? 0) >= convStreams, `прерванное чтение: запланированных чанков отброшено ${st.delayedChunksDropped ?? 0}, ожидалось не меньше ${convStreams}`);
++  expect(eventSeq(env) === repeatSeq('abort,readReject,cancel', convStreams), `порядок освобождения ресурсов: ${eventSeq(env)}`);
++  assertNoLiveTimeouts(env, '20.2');
++  assertGatewayCounted(rep, env, '20.2');
+ });
+ 
+ // ---------- собственные проверки инфраструктуры (этап 1 задачи A-2a) ----------

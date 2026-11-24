@@ -1,0 +1,463 @@
+diff --git a/archive_a2_stages/stage16_nocookie.js b/chatgpt_asset_probe_nocookie.js
+index 7fd2f20..c6fb175 100644
+--- a/archive_a2_stages/stage16_nocookie.js
++++ b/chatgpt_asset_probe_nocookie.js
+@@ -83,7 +83,20 @@
+   // произвольный объём памяти. Теперь JSON читается тем же потоковым контролем, что и файлы.
+   const MAX_JSON_BYTES = 4 * 1024 * 1024; // предел размера JSON-ответа backend-api
+   const API_HEAD_TIMEOUT_MS = 30000; // сколько ждём заголовки ответа API
+-  const DOWNLOAD_HEAD_TIMEOUT_MS = 120000; // сколько ждём заголовки ответа загрузки (тело ограничено лимитом байт, а не таймером)
++  const DOWNLOAD_HEAD_TIMEOUT_MS = 120000; // сколько ждём заголовки ответа загрузки
++  // ---------- таймауты чтения тела (этап 2 задачи A-2a, дефект F-2) ----------
++  // Таймер ожидания заголовков снимается, как только заголовки получены. Дальше тело охраняют
++  // два независимых ограничения: простой между чанками и общий срок чтения. Значения взяты из
++  // проекта (PROBE_A2A_DESIGN.md, §2.1): для JSON они фиксированы, для файла общий срок
++  // вычисляется из остатка бюджета и минимально допустимой скорости, поэтому живая, но медленная
++  // загрузка не обрывается, а зависшее соединение заканчивается предсказуемо.
++  const API_BODY_IDLE_TIMEOUT_MS = 15000; // тишина между чанками JSON-ответа
++  const DOWNLOAD_BODY_IDLE_TIMEOUT_MS = 60000; // тишина между чанками тела файла
++  const API_BODY_TOTAL_TIMEOUT_MS = 90000; // общий срок чтения JSON-ответа (4 МиБ при 512 кбит/с)
++  const MIN_THROUGHPUT_BPS = 512000; // минимально допустимая средняя скорость загрузки, бит/с
++  const BODY_TOTAL_FLOOR_MS = 120000; // нижний предел общего срока чтения файла
++  const BODY_TOTAL_CEILING_MS = 900000; // верхний предел общего срока чтения файла
++  const CANCEL_TIMEOUT_MS = 1000; // сколько ждём саму отмену потока (П.4): она не идёт в сеть
+   // ---------- повторная проверка живости подписной ссылки (этап 5) ----------
+   // По умолчанию выключена: в обычном прогоне повторных загрузок файлов нет.
+   const LINK_LIFETIME_CHECK = false; // отдельный режим, включается явно
+@@ -175,17 +188,21 @@
+   // Проверка выполняется до первого сетевого запроса. Статус INVALID_CONTEXT означает,
+   // что зонд ничего не запрашивал и страницу не менял.
+   const contextIssues = [];
++  const abortSupported = typeof AbortController === 'function';
+   if (location.protocol !== 'https:') contextIssues.push('not_https');
+   if (location.hostname !== API_HOST) contextIssues.push('host_not_allowlisted'); // строгое равенство chatgpt.com
+   if (location.port && location.port !== API_PORT) contextIssues.push('unexpected_port');
+   if (/^\/(share|s)(\/|$)/.test(location.pathname)) contextIssues.push('share_page'); // публичная страница: своего чата здесь нет
++  // Без AbortController нельзя прервать ни одну фазу обращения, поэтому прежний обходной путь
++  // «fetch без сигнала» убран: в такой среде прогон не начинается (П.2).
++  if (!abortSupported) contextIssues.push('abort_controller_missing');
+   const abortReport = (issues) => ({
+     probeVersion: 'A-2',
+     at: new Date().toISOString(),
+     context: {
+       status: 'INVALID_CONTEXT',
+       issues,
+-      requiredContext: { protocol: 'https:', hostname: API_HOST, port: API_PORT, sharePageForbidden: true, authTokenRequired: true },
++      requiredContext: { protocol: 'https:', hostname: API_HOST, port: API_PORT, sharePageForbidden: true, authTokenRequired: true, abortControllerRequired: true },
+     },
+     pagePathTemplate: templatePath(location.pathname),
+     requests,
+@@ -250,58 +267,125 @@
+   // сменить маршрут символами / ? # ..
+   const safeId = (x) => typeof x === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(x);
+ 
++  // ---------------- снятие таймеров и отмена потоков (этап 2 задачи A-2a) ----------------
++  // У таймеров обращения (фаза 1 — ожидание заголовков, фазы 2–3 — простой и общий срок чтения
++  // тела) одна точка снятия: clearTimer для отдельного таймера и stopAll для всех сразу.
++  // Вызов идёт в ветках успеха, отказа и отмены, поэтому после завершившейся операции живых
++  // таймеров обращения не остаётся.
++  const clearTimer = (op, key) => {
++    if (!op) return;
++    const t = op[key];
++    op[key] = null;
++    if (t === null || t === undefined) return;
++    if (typeof clearTimeout !== 'function') return;
++    try {
++      clearTimeout(t);
++    } catch {
++      /* таймер уже снят */
++    }
++  };
++  const stopAll = (op) => {
++    for (const key of ['headTimer', 'idleTimer', 'totalTimer']) clearTimer(op, key);
++  };
++  // Отмена потока тоже может зависнуть (П.4): ждём её не больше CANCEL_TIMEOUT_MS. Незавершившаяся
++  // отмена не считается ошибкой прогона — она только фиксируется в cancelSettled/cancelMs.
++  // Само ожидание не отклоняется: ошибка отмены превращается в settled: false.
++  const cancelWithTimeout = async (target, reason) => {
++    if (!target || typeof target.cancel !== 'function') return { settled: false, ms: 0, skipped: true };
++    const t0 = performance.now();
++    let timerId = null;
++    const attempt = (async () => {
++      try {
++        await target.cancel(reason);
++        return true;
++      } catch {
++        return false; // поток уже закрыт или недоступен
++      }
++    })();
++    const guard = new Promise((resolve) => {
++      timerId = setTimeout(() => resolve(false), CANCEL_TIMEOUT_MS);
++    });
++    const settled = (await Promise.race([attempt, guard])) === true;
++    if (timerId !== null && typeof clearTimeout === 'function') {
++      try {
++        clearTimeout(timerId);
++      } catch {
++        /* таймер уже снят */
++      }
++    }
++    return { settled, ms: Math.round(performance.now() - t0) };
++  };
++
+   // Тело ответа, от которого мы отказались, надо закрыть: иначе соединение остаётся открытым
+-  // и браузер продолжает качивать тело (этап 13). Ошибку закрытия считаем нормой: поток мог
+-  // быть уже закрыт или недоступен.
++  // и браузер продолжает качивать тело (этап 13). Ожидание отмены ограничено по времени (П.4).
+   const discardBody = async (resp) => {
+     try {
+       if (resp?.body && typeof resp.body.cancel === 'function') {
+-        await resp.body.cancel('discarded');
++        await cancelWithTimeout(resp.body, 'discarded');
+       } else if (resp?.body && typeof resp.body.getReader === 'function') {
+-        await resp.body.getReader().cancel('discarded');
++        await cancelWithTimeout(resp.body.getReader(), 'discarded');
+       }
+     } catch {
+       /* поток уже закрыт или недоступен */
+     }
+   };
+ 
+-  // Таймаут ограничивает только ожидание заголовков ответа. После этого объём чтения контролируется
+-  // лимитом байт, а не таймером: большой файл не обрывается на середине из-за медленного канала.
+-  const abortSupported = typeof AbortController === 'function';
+-  const fetchHead = async (href, opts, headTimeoutMs) => {
+-    if (!abortSupported || !headTimeoutMs) return { resp: await fetch(href, opts) };
++  // ---------------- единый нижний шлюз сетевых обращений (П.2) ----------------
++  // Единственное место зонда, вызывающее fetch: обходного пути без AbortController больше нет
++  // (его отсутствие даёт INVALID_CONTEXT ещё до первого запроса). Учёт обращения note() ведётся
++  // внутри шлюза непосредственно перед fetch; там же создаётся AbortController и ставится таймер
++  // фазы 1. Решений о лимитах запросов и байтов здесь нет — они добавляются на этапе 4 A-2a,
++  // а options.declaredBytes (заявленный размер) закреплён контрактом заранее.
++  const netSend = async (purpose, href, init, options = {}) => {
++    note(purpose === 'download' ? (init?.headers?.Range ? 'GET-range' : 'GET-bytes') : 'GET', href);
+     const ctrl = new AbortController();
+-    let fired = false;
+-    const timer = setTimeout(() => {
+-      fired = true;
++    const headTimeoutMs = purpose === 'download' ? DOWNLOAD_HEAD_TIMEOUT_MS : API_HEAD_TIMEOUT_MS;
++    const op = {
++      kind: purpose,
++      ctrl,
++      headTimer: null,
++      idleTimer: null,
++      totalTimer: null,
++      headFired: false,
++      headTimeoutMs,
++      declaredBytes: Number(options?.declaredBytes ?? 0) || null,
++    };
++    op.headTimer = setTimeout(() => {
++      op.headFired = true;
+       try {
+         ctrl.abort('head_timeout');
+       } catch {
+         /* контроллер уже закрыт */
+       }
+     }, headTimeoutMs);
++    let resp;
+     try {
+-      const resp = await fetch(href, { ...opts, signal: ctrl.signal });
+-      if (typeof clearTimeout === 'function') {
+-        try {
+-          clearTimeout(timer);
+-        } catch {
+-          /* таймер уже снят */
+-        }
+-      }
+-      return { resp };
++      resp = await fetch(href, { ...init, signal: ctrl.signal });
+     } catch (e) {
+-      if (typeof clearTimeout === 'function') {
+-        try {
+-          clearTimeout(timer);
+-        } catch {
+-          /* таймер уже снят */
+-        }
+-      }
+-      if (fired) e.seHeadTimeout = true;
++      // обращение завершилось (в том числе по таймеру фазы 1): её таймер снимаем здесь же
++      clearTimer(op, 'headTimer');
++      if (op.headFired) e.seHeadTimeout = true;
+       throw e;
+     }
++    return { resp, ctrl, op };
++  };
++  // Контракт (§2.2, п.1): fetchHead возвращает { resp, ctrl, stopHeadTimer } и сам таймер фазы 1
++  // не снимает — его снимает тот, кто начинает следующую фазу чтения, иначе между fetch и
++  // чтением остаётся окно без охраны.
++  const fetchHead = async (purpose, href, init) => {
++    const s = await netSend(purpose, href, init);
++    return { resp: s.resp, ctrl: s.ctrl, op: s.op, stopHeadTimer: () => clearTimer(s.op, 'headTimer') };
+   };
++  // Таймауты чтения тела по типу обращения (§2.1). Для файла общий срок считается из объёма,
++  // который ещё можно принять, и минимально допустимой скорости: ожидание заканчивается там, где
++  // канал стабильно медленнее допустимого, и не мешает нормальной загрузке.
++  const bodyLimits = (kind, room) =>
++    kind === 'download'
++      ? {
++          idleTimeoutMs: DOWNLOAD_BODY_IDLE_TIMEOUT_MS,
++          totalTimeoutMs: Math.min(BODY_TOTAL_CEILING_MS, Math.max(BODY_TOTAL_FLOOR_MS, Math.ceil((Math.max(0, room) * 8 * 1000) / MIN_THROUGHPUT_BPS))),
++        }
++      : { idleTimeoutMs: API_BODY_IDLE_TIMEOUT_MS, totalTimeoutMs: API_BODY_TOTAL_TIMEOUT_MS };
+ 
+   const api = async (url) => {
+     let u;
+@@ -320,14 +404,17 @@
+     const headers = { Accept: 'application/json' };
+     if (token) headers.Authorization = `Bearer ${token}`; // только в памяти прогона; в отчёт/консоль/URL не попадает
+     // заголовок oai-device-id не отправляем: его значение живёт в cookie, а cookie мы не читаем
+-    note('GET', u.href);
++    // учёт обращения (note) ведёт шлюз netSend непосредственно перед fetch
+     const t0 = performance.now();
++    let op = null;
+     try {
+-      const h = await fetchHead(u.href, { method: 'GET', credentials: 'omit', headers, redirect: 'manual' }, API_HEAD_TIMEOUT_MS);
++      const h = await fetchHead('api', u.href, { method: 'GET', credentials: 'omit', headers, redirect: 'manual' });
+       const r = h.resp;
++      op = h.op;
+       // redirect по backend-api не обслуживаем: автоматически следовать нельзя, а кросс-доменный
+       // Location браузер не отдаёт. Фиксируем отказ явно, статус сохраняем.
+       if (r.status >= 300 && r.status < 400) {
++        h.stopHeadTimer(); // чтение не начинается: таймер фазы 1 снимаем до закрытия тела
+         await discardBody(r); // разыменовывать редирект не будем — тело закрываем сразу
+         return { status: r.status, contentType: '', ms: Math.round(performance.now() - t0), ok: false, json: null, redirectBlocked: true };
+       }
+@@ -341,13 +428,15 @@
+         const jsonRoom = Math.min(MAX_JSON_BYTES, MAX_TOTAL_BYTES - bytesReadFromNetwork);
+         let body;
+         if (jsonRoom <= 0) {
++          h.stopHeadTimer();
+           await discardBody(r);
+           body = { status: 'SKIPPED_LIMIT', reason: 'total_limit_before_start', receivedBytes: 0, declaredSize: null, limitBytes: 0 };
+         } else {
+-          body = await readCapped(r, jsonRoom);
++          // чтение JSON охраняется теми же таймерами, что и чтение файла (§2.2)
++          body = await readCapped(r, jsonRoom, { ...bodyLimits('api', jsonRoom), ctrl: h.ctrl, kind: 'api', op: h.op });
+         }
+         apiBytesRead += body.receivedBytes ?? 0; // JSON тоже тратит лимит сети прогона, но учитывается отдельно
+-        jsonRead = { status: body.status, reason: body.reason ?? null, receivedBytes: body.receivedBytes ?? 0, declaredSize: body.declaredSize ?? null, limitBytes: body.limitBytes ?? null };
++        jsonRead = { status: body.status, reason: body.reason ?? null, receivedBytes: body.receivedBytes ?? 0, declaredSize: body.declaredSize ?? null, limitBytes: body.limitBytes ?? null, cancelSettled: body.cancelSettled ?? null, cancelMs: body.cancelMs ?? null };
+         if (body.status === 'OK') {
+           try {
+             json = JSON.parse(new TextDecoder().decode(body.bytes));
+@@ -356,10 +445,12 @@
+           }
+         }
+       } else {
++        h.stopHeadTimer(); // тело не-JSON ответа не читаем: таймер фазы 1 снимаем до закрытия потока
+         await discardBody(r); // тело не-JSON ответа не читаем целиком, а закрываем поток
+       }
+       return { status: r.status, contentType: ct, ms: Math.round(performance.now() - t0), ok: r.ok, json, jsonRead };
+     } catch (e) {
++      stopAll(op); // на любом исходе обращения его таймеры не должны оставаться живыми
+       const msg = String(e?.message ?? e);
+       const timedOut = Boolean(e?.seHeadTimeout) || e?.name === 'TimeoutError' || /abort/i.test(msg);
+       return { status: null, error: msg, reason: timedOut ? 'request_timeout' : null, timeout: timedOut, ms: Math.round(performance.now() - t0) };
+@@ -377,17 +468,67 @@
+ 
+   // Потоковое чтение ответа: объём контролируется во время загрузки, а не после неё.
+   // room = сколько байтов ещё можно принять (учитывает лимит на файл и остаток общего лимита).
+-  const readCapped = async (resp, room) => {
++  // phase = { idleTimeoutMs, totalTimeoutMs, ctrl, kind, op }: таймеры фаз 2–3 и общий контроллер
++  // обращения (§2.2). Чтение прекращается по простою между чанками либо по общему сроку чтения;
++  // при любом отказе порядок освобождения ресурсов один: сначала abort() запроса, затем
++  // ограниченная по времени отмена потока (П.4).
++  const readCapped = async (resp, room, phase = {}) => {
++    const ctrl = phase.ctrl ?? null;
++    const op = phase.op ?? null;
++    const idleTimeoutMs = Number(phase.idleTimeoutMs) || 0;
++    const totalTimeoutMs = Number(phase.totalTimeoutMs) || 0;
+     const declaredLen = Number(resp.headers.get('content-length') || 0) || null;
+     if (declaredLen && declaredLen > room) {
++      stopAll(op); // чтение не начинается: таймеры обращения снимаем до закрытия тела
+       await discardBody(resp); // читать не начинаем, но тело закрываем сразу (этап 13)
+       return { status: 'SKIPPED_LIMIT', reason: 'content_length_over_limit', declaredSize: declaredLen, limitBytes: room, receivedBytes: 0 };
+     }
+     const reader = resp.body && typeof resp.body.getReader === 'function' ? resp.body.getReader() : null;
+     if (!reader) {
++      stopAll(op);
+       // Потока нет: операцию завершаем с понятным статусом, на неограниченный arrayBuffer не уходим.
+       return { status: 'UNSUPPORTED', reason: 'stream_unavailable', declaredSize: declaredLen, limitBytes: room, receivedBytes: 0 };
+     }
++    // Заголовки получены и чтение начинается: таймер фазы 1 снимается в тот же момент, когда
++    // поставлены таймеры тела, — окна без охраны между фазами не остаётся (§2.2, п.1).
++    let idleFired = false;
++    let totalFired = false;
++    const armIdle = () => {
++      if (!op || idleTimeoutMs <= 0) return;
++      clearTimer(op, 'idleTimer');
++      op.idleTimer = setTimeout(() => {
++        idleFired = true;
++        try {
++          ctrl?.abort('body_idle_timeout');
++        } catch {
++          /* контроллер уже закрыт */
++        }
++      }, idleTimeoutMs);
++    };
++    clearTimer(op, 'headTimer');
++    if (op && totalTimeoutMs > 0) {
++      op.totalTimer = setTimeout(() => {
++        totalFired = true;
++        try {
++          ctrl?.abort('body_total_timeout');
++        } catch {
++          /* контроллер уже закрыт */
++        }
++      }, totalTimeoutMs);
++    }
++    armIdle();
++    // Ни abort(), ни отмена потока не считаются обязательными для успеха: оба защищены, а исход
++    // отмены фиксируется в отказной записи (П.4).
++    const releaseStream = async (reasonText) => {
++      if (ctrl) {
++        try {
++          ctrl.abort(reasonText);
++        } catch {
++          /* контроллер уже закрыт */
++        }
++      }
++      return await cancelWithTimeout(reader, reasonText);
++    };
+     let acc = declaredLen && declaredLen <= room ? new Uint8Array(declaredLen) : null;
+     const chunks = [];
+     let got = 0;
+@@ -396,13 +537,12 @@
+       try {
+         item = await reader.read();
+       } catch (e) {
+-        // Поток упал в середине: его тоже надо закрыть, иначе соединение висит открытым (этап 13).
+-        try {
+-          await reader.cancel('read_failed');
+-        } catch {
+-          /* поток уже закрыт */
+-        }
+-        return { status: 'NETWORK_ERROR', reason: 'stream_read_failed', receivedBytes: got, declaredSize: declaredLen, limitBytes: room, error: String(e?.message ?? e) };
++        // Флаги таймеров проверяются раньше, чем «настоящий» сетевой сбой: иначе прерванное
++        // таймером чтение нельзя отличить от обрыва соединения (§2.2, п.3).
++        const reason = idleFired ? 'body_idle_timeout' : totalFired ? 'body_total_timeout' : 'stream_read_failed';
++        stopAll(op);
++        const c = await releaseStream(reason);
++        return { status: 'NETWORK_ERROR', reason, timeout: idleFired || totalFired, receivedBytes: got, declaredSize: declaredLen, limitBytes: room, error: String(e?.message ?? e), cancelSettled: c.settled, cancelMs: c.ms };
+       }
+       if (item && item.done) break;
+       const v = item && item.value;
+@@ -411,11 +551,8 @@
+       // превышен, уже пришёл по сети, и он должен быть учтён в лимите прогона.
+       bytesReadFromNetwork += v.byteLength;
+       if (got + v.byteLength > room) {
+-        try {
+-          await reader.cancel('over_limit');
+-        } catch {
+-          /* already cancelled */
+-        }
++        stopAll(op);
++        const c = await releaseStream('over_limit');
+         return {
+           status: 'SKIPPED_LIMIT',
+           reason: 'stream_over_limit',
+@@ -423,6 +560,8 @@
+           attemptedBytes: got + v.byteLength,
+           limitBytes: room,
+           declaredSize: declaredLen,
++          cancelSettled: c.settled,
++          cancelMs: c.ms,
+         };
+       }
+       if (acc && got + v.byteLength > acc.length) {
+@@ -432,7 +571,9 @@
+       if (acc) acc.set(v, got);
+       else chunks.push(v);
+       got += v.byteLength;
++      armIdle(); // чанк получен: отсчёт простоя начинается заново (§2.2, п.2)
+     }
++    stopAll(op); // чтение завершено: ни таймера фазы 1, ни таймеров тела не должно оставаться
+     let bytes = acc;
+     if (bytes && got !== bytes.length) {
+       // Тело оказалось короче заявленного content-length: хвост предвыделенного буфера — это нули,
+@@ -476,24 +617,25 @@
+         requests.blocked.push({ purpose: 'download', host: u.hostname, issues, hops });
+         return { status: 'UNTRUSTED_DOWNLOAD_HOST', host: u.hostname, issues, redirectHops: hops };
+       }
+-      note(extraHeaders.Range ? 'GET-range' : 'GET-bytes', u.href);
+       downloadAttempts += 1;
+       downloadsInFlight += 1;
+       if (downloadsInFlight > downloadsMaxInFlight) downloadsMaxInFlight = downloadsInFlight;
+       const t0 = performance.now();
+-      let resp;
++      let h;
+       try {
+-        const h = await fetchHead(u.href, { method: 'GET', credentials: 'omit', redirect: 'manual', headers: extraHeaders }, DOWNLOAD_HEAD_TIMEOUT_MS);
+-        resp = h.resp;
++        // учёт обращения (note) и таймер ожидания заголовков — внутри шлюза netSend
++        h = await fetchHead('download', u.href, { method: 'GET', credentials: 'omit', redirect: 'manual', headers: extraHeaders });
+       } catch (e) {
+         downloadsInFlight -= 1;
+         const msg = String(e?.message ?? e);
+         const timedOut = Boolean(e?.seHeadTimeout) || e?.name === 'TimeoutError' || /abort/i.test(msg);
+         return { status: 'NETWORK_ERROR', host: u.hostname, error: msg, reason: timedOut ? 'download_timeout' : null, ms: Math.round(performance.now() - t0) };
+       }
++      const resp = h.resp;
+       downloadsInFlight -= 1;
+       const ms = Math.round(performance.now() - t0);
+       if ((resp.status >= 300 && resp.status < 400) || resp.type === 'opaqueredirect') {
++        h.stopHeadTimer(); // тело 3xx не читается: таймер фазы 1 снимаем до закрытия потока
+         // Тело 3xx-ответа — не файл: закрываем его до любого перехода и до отказа (этап 13).
+         await discardBody(resp);
+         if (!CDN_FOLLOW_REDIRECTS) {
+@@ -518,10 +660,13 @@
+         continue;
+       }
+       if (!resp.ok) {
++        h.stopHeadTimer(); // тело ошибки не читается: таймер фазы 1 снимаем до закрытия потока
+         await discardBody(resp); // тело ошибки не читается: закрываем, вызывающему нужен только статус
+         return { status: 'HTTP_ERROR', host: u.hostname, httpStatus: resp.status, ms, resp };
+       }
+-      return { status: 'OK', host: u.hostname, ms, resp };
++      // ctrl и op передаются вызывающему: чтение тела продолжает охраняться тем же сигналом
++      // и теми же таймерами обращения (§2.2, п.1), поэтому readCapped не начинает охрану заново.
++      return { status: 'OK', host: u.hostname, ms, resp, ctrl: h.ctrl, op: h.op };
+     }
+   };
+ 
+@@ -682,11 +827,12 @@
+               countedInTotals: false,
+             };
+           } else {
+-            const r = await readCapped(d.resp, room);
++            const r = await readCapped(d.resp, room, { ...bodyLimits('download', room), ctrl: d.ctrl, kind: 'download', op: d.op });
+             if (r.status !== 'OK') {
+               rec.bytes = {
+                 status: r.status,
+                 reason: r.reason,
++                timeout: r.timeout ?? false,
+                 host: d.host,
+                 httpStatus: d.resp.status,
+                 declaredSizeFromApi: declared || null,
+@@ -694,6 +840,8 @@
+                 limitBytes: r.limitBytes,
+                 receivedBytes: r.receivedBytes ?? 0,
+                 attemptedBytes: r.attemptedBytes ?? null,
++                cancelSettled: r.cancelSettled ?? null, // исход ограниченной отмены потока (П.4)
++                cancelMs: r.cancelMs ?? null,
+                 countedInTotals: false,
+                 ms: d.ms,
+               };
+@@ -741,7 +889,7 @@
+     tokenSourceElementId: bootstrap ? (document.getElementById('client-bootstrap') ? 'client-bootstrap' : '__NEXT_DATA__') : null,
+     hasDeviceId: deviceId, // cookie не читаем, поэтому всегда null; обхода через cookie не делаем
+     cookiePolicy: 'cookies не читаются и не передаются: все fetch идут с credentials: omit',
+-    flags: { DOM_SURVEY, MAX_FILES_PER_CHAT, MAX_TOTAL_FILES, MAX_BYTES_PER_FILE, MAX_TOTAL_BYTES, MAX_JSON_BYTES, API_HEAD_TIMEOUT_MS, DOWNLOAD_HEAD_TIMEOUT_MS, LINK_LIFETIME_CHECK, LINK_LIFETIME_MAX_ASSETS, LINK_LIFETIME_RANGE_BYTES, LINK_LIFETIME_MAX_BYTES_TOTAL, DIAGNOSTIC_IDS },
++    flags: { DOM_SURVEY, MAX_FILES_PER_CHAT, MAX_TOTAL_FILES, MAX_BYTES_PER_FILE, MAX_TOTAL_BYTES, MAX_JSON_BYTES, API_HEAD_TIMEOUT_MS, DOWNLOAD_HEAD_TIMEOUT_MS, API_BODY_IDLE_TIMEOUT_MS, DOWNLOAD_BODY_IDLE_TIMEOUT_MS, API_BODY_TOTAL_TIMEOUT_MS, MIN_THROUGHPUT_BPS, BODY_TOTAL_FLOOR_MS, BODY_TOTAL_CEILING_MS, CANCEL_TIMEOUT_MS, LINK_LIFETIME_CHECK, LINK_LIFETIME_MAX_ASSETS, LINK_LIFETIME_RANGE_BYTES, LINK_LIFETIME_MAX_BYTES_TOTAL, DIAGNOSTIC_IDS },
+     abortControllerSupported: abortSupported, // если false — таймауты не применяются, это видно в отчёте
+     pathWordsAllowlist: [...PATH_WORDS], // какие сегменты пути считаются литеральными (этот список — единственный источник «смысловых» слов в путях отчёта)
+     context: { status: 'OK', issues: [] }, // контекст проверен до первого запроса (этап 7)
+@@ -975,7 +1123,7 @@
+         report.linkLifetimeCheck.results.push({ assetLabel: a.assetLabel, status: d.status, reason: d.reason ?? null, host: d.host ?? null });
+         continue;
+       }
+-      const r = await readCapped(d.resp, room);
++      const r = await readCapped(d.resp, room, { ...bodyLimits('download', room), ctrl: d.ctrl, kind: 'download', op: d.op });
+       const headNow = r.status === 'OK' || r.bytes ? head(r.bytes ?? new Uint8Array(0)) : null;
+       linkBytesTotal += r.receivedBytes ?? 0;
+       report.linkLifetimeCheck.results.push({
