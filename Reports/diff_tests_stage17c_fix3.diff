@@ -1,0 +1,192 @@
+diff --git "a/C:\\Users\\User\\AppData\\Local\\Temp\\probe_a2_tests.stage17c_reviewed.mjs" b/probe_a2_tests.mjs
+index c531997..06e49e0 100644
+--- "a/C:\\Users\\User\\AppData\\Local\\Temp\\probe_a2_tests.stage17c_reviewed.mjs"
++++ b/probe_a2_tests.mjs
+@@ -176,17 +176,20 @@ export function makeAbortHub(getNow = () => 0) {
+ //   failAfter   — после N отданных чанков read() отклоняется (обрыв соединения);
+ //   delayChunks — задержка мс виртуального времени между чанками (медленный канал);
+ //   cancelMode  — 'immediate' | 'delayed' | 'never' | 'syncThrow' | 'asyncThrow' — как ведёт
+-//                 себя underlying cancel(): завершается, задерживается, висит, бросает
+-//                 синхронно, отклоняет свой промис.
++//                 себя cancel() ИСТОЧНИКА (underlying source callback): завершается,
++//                 задерживается, висит, бросает синхронно, возвращает отклонённый промис.
++//                 Публичный reader.cancel()/body.cancel() при этом синхронно не бросает:
++//                 любое поведение источника наружу приходит отклонённым Promise.
+ // Семантика отмены разделена, как у настоящего ReadableStream:
+ //   снятие AbortSignal -> висящее и следующее чтение отклоняются с AbortError;
+ //   reader.cancel()    -> поток закрывается: висящее и следующие чтения дают done: true,
+ //                         данных после отмены не выдаётся никогда;
+ //   закрытие потока (closed) не зависит от того, завершился ли промис underlying cancel():
+ //   cancel() закрывает поток сразу, а его промис отвечает только за исход отмены.
+-//   Ошибка underlying cancel() (режимы syncThrow и asyncThrow) видна ТОЛЬКО в промисе
+-//   cancel(): поток при этом закрыт нормально, closed резолвится, состояние закрытия —
+-//   'cancelled', не 'errored'.
++//   Ошибка underlying cancel() (режимы syncThrow и asyncThrow) видна ТОЛЬКО в отклонении
++//   промиса cancel(): поток при этом закрыт нормально, closed резолвится, состояние
++//   закрытия — 'cancelled', не 'errored'. syncThrow и asyncThrow различаются только
++//   поведением источника; внешняя семантика публичного cancel() у них одинакова.
+ // Границы модели:
+ //   - поток отдаёт один и тот же читатель; полноценная блокировка не моделируется,
+ //     второй getReader() помечается в stats.getReaderWhileLocked и не считается нормой A-2;
+@@ -356,25 +359,16 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+     });
+   }
+ 
+-  function doCancel(reason) {
+-    bump('cancels');
+-    stats.cancelReason = reason;
+-    stats.cancelMode = cancelMode;
+-    stats.chunksGivenAtCancel = chunksGiven;
+-    dropPendingChunk('cancel');
+-    finishPendingReadAsDone();
+-    cancelled = true;
+-    closeStream('cancelled');   // отмена закрывает поток независимо от исхода underlying cancel()
+-    detachSignal();
++  // Cancel callback источника (underlying source): поведение самого источника.
++  // syncThrow  — источник бросает исключение синхронно;
++  // asyncThrow — источник возвращает отклонённый промис.
++  // Наружу в обоих случаях уходит отклонённый Promise: публичный cancel() синхронно не бросает.
++  function underlyingCancel() {
+     if (cancelMode === 'syncThrow') {
+-      // ошибка underlying cancel() отражается только в промисе cancel(): поток при этом
+-      // закрыт штатно, closed резолвится, состояние закрытия остаётся 'cancelled'
+       bump('cancelThrows');
+       throw new Error('fixture_cancel_sync_throw');
+     }
+     if (cancelMode === 'asyncThrow') {
+-      // та же картина в честной форме промиса: underlying cancel() отклоняет промис cancel(),
+-      // поток при этом уже закрыт штатно
+       bump('cancelThrows');
+       return Promise.reject(new Error('fixture_cancel_async_throw'));
+     }
+@@ -383,7 +377,6 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+       return new Promise(() => {});
+     }
+     if (cancelMode === 'delayed') {
+-      if (!clock) throw new Error('cancelMode delayed требует виртуальные часы clock в makeStream');
+       bump('cancelStarted');
+       return new Promise((resolve) => {
+         clock.setTimeout(() => { bump('cancelSettled'); resolve(); }, cancelDelayMs);
+@@ -393,6 +386,28 @@ export function makeStream(bytes, opts = {}, stats = {}) {
+     return Promise.resolve();
+   }
+ 
++  function doCancel(reason) {
++    // ошибка настройки фикстуры, а не поведение потока: бросаем сразу и до изменения состояния
++    if (cancelMode === 'delayed' && !clock) throw new Error('cancelMode delayed требует виртуальные часы clock в makeStream');
++    bump('cancels');
++    stats.cancelReason = reason;
++    stats.cancelMode = cancelMode;
++    stats.chunksGivenAtCancel = chunksGiven;
++    dropPendingChunk('cancel');
++    finishPendingReadAsDone();
++    cancelled = true;
++    closeStream('cancelled');   // отмена закрывает поток независимо от исхода underlying cancel()
++    detachSignal();
++    let p;
++    try {
++      p = underlyingCancel();
++    } catch (e) {
++      // синхронный выброс источника становится отклонённым промисом публичного cancel()
++      p = Promise.reject(e);
++    }
++    return Promise.resolve(p);
++  }
++
+   let readerGivenOut = false;
+   const reader = { read: readChunk, cancel: (reason) => doCancel(reason), closed, releaseLock() { bump('releaseLocks'); readerGivenOut = false; } };
+   const body = {
+@@ -1564,13 +1579,22 @@ test('I4', 'инфраструктура: четыре режима cancel() и
+   expect(c.cancelStarted === 1 && !c.cancelSettled, `учёт незавершаемой отмены: ${JSON.stringify(c)}`);
+   void never;
+ 
+-  // I4.4 Синхронный выброс: cancel() бросает сразу, прогон не зависает
++  // I4.4 Выбор источника: reader.cancel() не бросает синхронно, наружу отклонённый промис
++  // с ошибкой источника; поток закрыт ('cancelled'), reader.closed резолвится, прогон не виснет
+   const d = {};
+   const sd = makeStream(bytes, { chunkSize: 100, clock, cancelMode: 'syncThrow' }, d);
+-  let threw = null;
+-  try { sd.cancel('sync_throw'); } catch (e) { threw = e; }
+-  expect(threw !== null && /fixture_cancel_sync_throw/.test(threw.message), `синхронный выброс cancel(): ${describeReason(threw)}`);
+-  expect(d.cancelThrows === 1, `счётчик выбросов cancel(): ${d.cancelThrows ?? 0}`);
++  const rd4 = sd.getReader();
++  let syncEscape = null;
++  let cancelResult = null;
++  try { cancelResult = rd4.cancel('sync_throw'); } catch (e) { syncEscape = e; }
++  expect(syncEscape === null, `reader.cancel() выбросил синхронно: ${describeReason(syncEscape)}`);
++  expect(cancelResult && typeof cancelResult.then === 'function', 'reader.cancel() вернул не промис');
++  out = await settleWithin(cancelResult, clock, 1000, 500);
++  expect(out.state === 'rejected' && /fixture_cancel_sync_throw/.test(out.error.message), `промис cancel() не отклонён ошибкой источника: ${out.state}`);
++  expect(d.cancelThrows === 1, `счётчик выбросов underlying cancel(): ${d.cancelThrows ?? 0}`);
++  expect(d.closedState === 'cancelled', `состояние потока при выбросе источника: ${d.closedState}`);
++  const closedAfterThrow = await settleWithin(rd4.closed, clock, 1000, 500);
++  expect(closedAfterThrow.state === 'ok', `reader.closed не завершился при выбросе источника: ${closedAfterThrow.state}`);
+ 
+   // I4.5 Обычный cancel() закрывает поток, а не отклоняет чтение: зависшее read() завершается
+   // done без данных, последующие чтения тоже done без данных, AbortError не появляется.
+@@ -1711,14 +1735,17 @@ test('I7', 'инфраструктура: closed отражает закрыти
+   out = await settleWithin(rc.closed, clock, 200, 100);
+   expect(out.state === 'ok' && c.closedState === 'closed', `closed после полного чтения: ${JSON.stringify(c)}`);
+ 
+-  // I7.4 syncThrow: ошибка underlying cancel() живёт только в промисе cancel(); сам поток
+-  // закрыт штатно — закрытие 'cancelled', последующие чтения дают done
++  // I7.4 syncThrow: источник бросает синхронно, но публичный reader.cancel() исключения не
++  // даёт — наружу отклонённый Promise; поток закрыт штатно ('cancelled'), чтения дают done
+   const d = {};
+   const sd = makeStream(bytes, { chunkSize: 100, clock, cancelMode: 'syncThrow' }, d);
+   const rd = sd.getReader();
+-  let threw = null;
+-  try { rd.cancel('sync_throw'); } catch (e) { threw = e; }
+-  expect(threw !== null && /fixture_cancel_sync_throw/.test(threw.message), `синхронный выброс cancel(): ${describeReason(threw)}`);
++  let syncEscape = null;
++  let cancelPromiseSync = null;
++  try { cancelPromiseSync = rd.cancel('sync_throw'); } catch (e) { syncEscape = e; }
++  expect(syncEscape === null, `reader.cancel() выбросил синхронно: ${describeReason(syncEscape)}`);
++  out = await settleWithin(cancelPromiseSync, clock, 1000, 500);
++  expect(out.state === 'rejected' && /fixture_cancel_sync_throw/.test(out.error.message), `промис cancel() не отклонён ошибкой источника: ${out.state}`);
+   expect(d.cancelThrows === 1 && d.closedState === 'cancelled', `ошибка cancel() перевела поток в ошибочное состояние: ${JSON.stringify(d)}`);
+   expect(d.closedState !== 'errored', `поток помечен ошибкой из-за выброса underlying cancel(): ${d.closedState}`);
+   const afterThrow = await rd.read();
+@@ -1732,8 +1759,8 @@ test('I7', 'инфраструктура: closed отражает закрыти
+   expect(out.state === 'ok', `closed потока не завершился при выбросе underlying cancel(): ${out.state}`);
+   expect(d.closedResolved === 1, `счётчик закрытия потока: ${d.closedResolved ?? 0}`);
+ 
+-  // I7.6 та же ошибка underlying cancel() в честной форме промиса (asyncThrow): отклоняется
+-  // промис cancel(), а закрытие потока (reader.closed) по-прежнему завершается успешно
++  // I7.6 asyncThrow: источник возвращает отклонённый промис; закрытие потока (reader.closed)
++  // по-прежнему завершается успешно, состояние потока — 'cancelled'
+   const e = {};
+   const se2 = makeStream(bytes, { chunkSize: 100, clock, cancelMode: 'asyncThrow' }, e);
+   const re2 = se2.getReader();
+@@ -1744,6 +1771,31 @@ test('I7', 'инфраструктура: closed отражает закрыти
+   expect(out.state === 'ok' && e.closedState === 'cancelled', `reader.closed при asyncThrow: ${out.state}, ${JSON.stringify(e)}`);
+   const afterAsync = await re2.read();
+   expect(afterAsync.done === true, `поток после asyncThrow отдаёт данные: ${afterAsync.done}`);
++
++  // I7.7 syncThrow и asyncThrow различаются только поведением источника: внешняя семантика
++  // публичного cancel() у них одинакова (форма и исход, закрытие потока, чтение после отмены)
++  const parity = {};
++  for (const mode of ['syncThrow', 'asyncThrow']) {
++    const st = {};
++    const s = makeStream(bytes, { chunkSize: 100, clock, cancelMode: mode }, st);
++    const r = s.getReader();
++    let esc = null;
++    let pr = null;
++    try { pr = r.cancel('parity_' + mode); } catch (err) { esc = err; }
++    const cancelOutcome = await settleWithin(pr, clock, 1000, 500);
++    parity[mode] = {
++      cancelThrowsSync: esc === null,
++      returnsPromise: typeof (pr && pr.then) === 'function',
++      cancelState: cancelOutcome.state,
++      closedState: st.closedState,
++      closedOutcome: (await settleWithin(r.closed, clock, 1000, 500)).state,
++      closedResolved: st.closedResolved ?? 0,
++      cancelSettled: st.cancelSettled ?? 0,
++      readAfterIsDone: (await r.read()).done === true,
++    };
++  }
++  expect(JSON.stringify(parity.syncThrow) === JSON.stringify(parity.asyncThrow), `внешняя семантика режимов различается: ${JSON.stringify(parity)}`);
++  expect(parity.syncThrow.cancelThrowsSync && parity.syncThrow.cancelState === 'rejected' && parity.syncThrow.closedState === 'cancelled', `режим syncThrow выбивается из семантики: ${JSON.stringify(parity.syncThrow)}`);
+   await nextMacrotasks(2);
+   expect(rejectionList.length === 0, `ошибка underlying cancel() породила необработанное отклонение: ${rejectionList.map((r) => `${r.test}: ${r.text}`).join('; ')}`);
+ });
