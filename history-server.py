@@ -85,7 +85,31 @@ try:
 except Exception as e:
     print(f"[ERROR] Cannot create memory.md: {e}")
     
-for _dir in (CHATS_DIR, BACKUP_DIR, MEMORY_DIR, BASE_DIR / "profiles"):
+# A3: осколки временных файлов импортёра. Импортёр пишет временный файл с меткой
+# ".importer." и суффиксом ".tmp" (importer_v2.store.tmp_name) — в chats\ и в
+# вложенных каталогах attachments\<chat_id>\. При запуске сервера удаляются
+# ТОЛЬКО такие файлы и ТОЛЬКО старше порога: раньше здесь вычищались все
+# *.tmp подряд, из-за чего сервер мог стереть временный файл работающего
+# процесса импорта (он падал с [WinError 2]). Файлы другого назначения в этих
+# каталогах не трогаются.
+IMPORT_TMP_MAX_AGE_SEC = 30 * 60
+_tmp_removed = _tmp_fresh = 0
+for _dir in (CHATS_DIR, ATTACH_DIR):
+    if _dir.exists():
+        for _tmp in _dir.rglob("*.importer.*.tmp"):
+            try:
+                if time.time() - _tmp.stat().st_mtime > IMPORT_TMP_MAX_AGE_SEC:
+                    _tmp.unlink()
+                    _tmp_removed += 1
+                else:
+                    _tmp_fresh += 1
+            except Exception:
+                pass
+if _tmp_removed or _tmp_fresh:
+    print(f"[START] Временные файлы импортёра: удалено {_tmp_removed} "
+          f"(старше {IMPORT_TMP_MAX_AGE_SEC // 60} мин), оставлено как свежие: {_tmp_fresh}")
+
+for _dir in (BACKUP_DIR, MEMORY_DIR, BASE_DIR / "profiles"):
     if _dir.exists():
         for _tmp in _dir.glob("*.tmp"):
             try: _tmp.unlink()
@@ -309,21 +333,6 @@ def _sanitize_title(title, fallback="Untitled"):
         flat = flat[:_TITLE_MAX].rstrip() + "…"
     return flat
 
-def _atomic_write_json(path: Path, data, *, indent=2):
-    """Атомарная запись JSON. tmp — в той же директории. Чистка при ошибке."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=indent)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try: os.unlink(tmp)
-        except FileNotFoundError: pass
-        raise
-
 def _cleanup_backups(chat_id: str):
     """Оставляем только 3 последних бэкапа для чата. Файлы корзины (DELETED_*) не трогаем."""
     import re
@@ -341,15 +350,105 @@ def _cleanup_backups(chat_id: str):
     except Exception as e:
         print(f"[BACKUP ERROR] Cleanup failed: {e}")
         
+# ============ КЛЮЧ ПОРЯДКА ИСТОРИИ (Stage 16.1, вариант A) ==================
+# Положение чата в истории определяет только семантическое время из самого
+# JSON: updated_at -> created_at -> imported_at. Время изменения файла
+# (st_mtime) в порядке не участвует: любая перезапись файла (фоновый скрипт,
+# автосохранение, пин) иначе перетасовывает ленту и границы страниц.
+# Равные значения разрешаются по id — порядок устойчив между запросами.
+
+_EPOCH_DT = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _to_ms(value):
+    """ISO-строка (Z / смещение / naive) или epoch (сек/мс) -> целые миллисекунды.
+
+    Дробная часть усекается так же, как это делает Date.parse в браузере
+    (миллисекунды отбрасываются, а не округляются): сервер и клиент получают
+    идентичные ключи и идентичные ничьи, которые разрешаются по id.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if v <= 0:
+            return None
+        return int(v) if v > 1e11 else int(v * 1000)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    if s.isdigit() and len(s) >= 10:
+        v = float(s)
+        return int(v) if v > 1e11 else int(v * 1000)
+    dt = None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except Exception:
+                continue
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # naive-время = локальная зона, как в браузере
+    u = dt.astimezone(timezone.utc)
+    td = u - _EPOCH_DT
+    return td.days * 86400000 + td.seconds * 1000 + u.microsecond // 1000
+
+
+def chat_sort_ts(data):
+    """Семантическое время чата: updated_at -> created_at -> imported_at -> 0.
+    Целые миллисекунды — то же разрешение, что у Date.parse в браузере."""
+    for key in ("updated_at", "created_at", "imported_at"):
+        ms = _to_ms(data.get(key))
+        if ms is not None:
+            return ms
+    return 0
+
+
+def chat_discussion_ts(data):
+    """Время обсуждения (Stage 16.2): source_updated_at -> created_at -> imported_at -> 0.
+
+    updated_at не участвует: редактирование старого чата не должно менять его
+    место в хронологии обсуждений. Текущая дата не подставляется, mtime файла
+    не участвует. Чаты без достоверной даты уходят в хвост (0).
+    """
+    for key in ("source_updated_at", "created_at", "imported_at"):
+        ms = _to_ms(data.get(key))
+        if ms is not None:
+            return ms
+    return 0
+
+
+def public_updated_at(data, chat_file):
+    """updated_at для ответа: то же семейство полей, что и ключ порядка.
+    mtime — только если в чате нет ни одной даты, и с явным смещением."""
+    for key in ("updated_at", "created_at", "imported_at"):
+        val = data.get(key)
+        if val:
+            return val
+    try:
+        return datetime.fromtimestamp(chat_file.stat().st_mtime, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
 @app.get("/api/chats")
-async def list_chats(pinned_only: bool = False, page: int = 0, page_size: int = 120):
-    print(f"[API] GET /api/chats pinned_only={pinned_only} page={page} page_size={page_size}")
+async def list_chats(pinned_only: bool = False, page: int = 0, page_size: int = 120,
+                   sort_mode: str = "import"):
+    # Stage 16.2: "import" (прежний порядок Stage 16.1) | "discussion" (дата обсуждения)
+    if sort_mode not in ("import", "discussion"):
+        sort_mode = "import"
+    print(f"[API] GET /api/chats pinned_only={pinned_only} page={page} page_size={page_size} sort_mode={sort_mode}")
     if page < 0: page = 0
     if page_size < 1: page_size = 120
     if page_size > 500: page_size = 500
     try:
-        files = sorted(CHATS_DIR.glob("*.json"),
-                       key=lambda x: x.stat().st_mtime, reverse=True)
+        files = sorted(CHATS_DIR.glob("*.json"), key=lambda p: p.name)
         all_chats = []
         for f in files:
             try:
@@ -369,7 +468,8 @@ async def list_chats(pinned_only: bool = False, page: int = 0, page_size: int = 
                     "number": data.get("number"),
                     "title": _sanitize_title(data.get("title") or f.stem),
                     "created_at": data.get("created_at"),
-                    "updated_at": data.get("updated_at", datetime.fromtimestamp(f.stat().st_mtime).isoformat()),
+                    "updated_at": public_updated_at(data, f),
+                    "_sort_ts": chat_discussion_ts(data) if sort_mode == "discussion" else chat_sort_ts(data),
                     "imported_at": data.get("imported_at"),
                     "source_created_at": data.get("source_created_at"),
                     "model": data.get("model", "unknown"),
@@ -379,7 +479,8 @@ async def list_chats(pinned_only: bool = False, page: int = 0, page_size: int = 
             except Exception as e:
                 print(f"[WARNING] Cannot read {f.name}: {e}")
                 continue
-        all_chats.sort(key=lambda c: not c["pinned"])
+        # pinned первыми, затем семантическое время чата, затем id — до пагинации
+        all_chats.sort(key=lambda c: (not c["pinned"], -c["_sort_ts"], c["id"]))
         total = len(all_chats)
         start = page * page_size
         end = start + page_size
@@ -388,6 +489,7 @@ async def list_chats(pinned_only: bool = False, page: int = 0, page_size: int = 
         
         # Подгружаем карточки ТОЛЬКО для чатов на этой странице
         for chat in chats:
+            chat.pop("_sort_ts", None)
             idx_file = INDEX_DIR / f"{chat['id']}.json"
             if idx_file.exists():
                 try:
@@ -450,7 +552,11 @@ def _stem(word: str) -> str:
 
 
 @app.get("/api/chats/search")
-async def search_chats(q: str = "", tag: str = "", mode: str = "strict", pinned_only: bool = False):
+async def search_chats(q: str = "", tag: str = "", mode: str = "strict", pinned_only: bool = False,
+                     sort_mode: str = "import"):
+    # Stage 16.2: порядок строгого поиска; sort_mode не путать с mode (strict/smart)
+    if sort_mode not in ("import", "discussion"):
+        sort_mode = "import"
     import time as _time
     t0 = _time.perf_counter()
     
@@ -559,7 +665,7 @@ async def search_chats(q: str = "", tag: str = "", mode: str = "strict", pinned_
     except _re.error:
         return {"results": [], "query": query, "took_ms": 0.0, "truncated": False, "scanned": 0, "mode": "strict"}
         
-    files = sorted(CHATS_DIR.glob("*.json"), key=_mtime_or_zero, reverse=True)
+    files = sorted(CHATS_DIR.glob("*.json"), key=lambda p: p.name)
     
     for f in files:
         scanned += 1
@@ -601,16 +707,23 @@ async def search_chats(q: str = "", tag: str = "", mode: str = "strict", pinned_
                 "title": title,
                 "source": data.get("source"),
                 "updated_at": data.get("updated_at", ""),
+                "created_at": data.get("created_at"),
+                "source_updated_at": data.get("source_updated_at"),
+                "imported_at": data.get("imported_at"),
                 "snippet": best_snippet or "",
                 "msg_index": msg_index,
                 "match_in": "messages" if best_snippet is not None else "title",
-                "message_count": len(data.get("messages") or [])
+                "message_count": len(data.get("messages") or []),
+                "_sort_ts": chat_discussion_ts(data) if sort_mode == "discussion" else chat_sort_ts(data)
             })
-            if len(results) >= MAX_RESULTS:
-                break
                 
+    results.sort(key=lambda x: (-x["_sort_ts"], x["id"]))
+    total_matches = len(results)
+    results = results[:MAX_RESULTS]
+    for r in results:
+        r.pop("_sort_ts", None)
     took = (_time.perf_counter() - t0) * 1000
-    return {"results": results, "query": query, "took_ms": round(took, 1), "truncated": len(results) >= MAX_RESULTS and scanned < len(files), "scanned": scanned, "mode": "strict"}
+    return {"results": results, "query": query, "took_ms": round(took, 1), "truncated": total_matches > MAX_RESULTS, "scanned": scanned, "mode": "strict"}
     
 
 FILTERS_FILE = BASE_DIR / "saved_filters.json"
@@ -673,6 +786,181 @@ async def get_chat(chat_id: str):
         print(f"[ERROR] get_chat failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Stage 16.5: защита метаданных вложений при сохранении из UI.
+# Клиент описывает вложение своей схемой: поля, которых в payload нет или которые
+# пришли null/пустыми, сервер дописывает из предыдущей версии той же записи, если
+# вложение сопоставлено надёжно.
+# Сопоставление строгое: сначала надёжные идентификаторы (url, sha256, source_id,
+# source_ref, library_file_id), и только если у записи их вовсе нет — слабая пара
+# kind+name (именно так выглядит урезанный старый клиентский payload). Если
+# надёжные идентификаторы противоречат друг другу или под одним из них в прошлой
+# версии несколько разных записей, запись НЕ выбирается — слабое совпадение по
+# имени+типу в этом случае не спасает. Приоритет — запись из того же сообщения.
+# Значения из payload, которые клиент прислал непустыми, не перезаписываются:
+# правки пользователя остаются. Единственное исключение — source: UI по умолчанию
+# пишет «native», а поле происхождения пишет импортёр, поэтому native не должен
+# затирать chatgpt/qwen/deepseek/... у уже существющего вложения.
+# Поле text (содержимое файла) не восстанавливается — это пользовательский текст.
+# Ошибка сопоставления не маскируется: save_chat отменяет сохранение (см. вызов),
+# чтобы на диск не ушла потенциально урезанная версия чата.
+_ATT_META_FIELDS = ("source", "source_id", "source_ref", "url", "sha256", "size",
+                    "mime", "declared_mime", "format_hint", "width", "height",
+                    "library_file_id", "name", "kind", "status")
+_ATT_STR_KEYS = ("url", "sha256", "source_id", "source_ref", "library_file_id")
+_ATT_WEAK_KEY = "kind+name"
+
+
+def _att_key_val(v):
+    """Значение для ключа сопоставления: только непустая строка, иначе None."""
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+def _att_is_empty(v):
+    """Пусто ли поле у клиента: null, отсутствует или одна пробельная строка."""
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
+def _att_match_keys(att):
+    """(надёжные ключи, слабые ключи) для одной записи вложения."""
+    strong, weak = [], []
+    for fld in _ATT_STR_KEYS:
+        v = _att_key_val(att.get(fld))
+        if v:
+            strong.append((fld, v))
+    kind, name = _att_key_val(att.get("kind")), _att_key_val(att.get("name"))
+    if kind and name:
+        weak.append((_ATT_WEAK_KEY, kind + "\x00" + name))
+    return strong, weak
+
+
+def _att_sig(att):
+    """Снимок значимых полей — по нему видно, что под одним ключом две разные записи."""
+    return tuple((f, att.get(f)) for f in _ATT_META_FIELDS)
+
+
+def _iter_atts(messages):
+    for mi, msg in enumerate(messages or []):
+        if not isinstance(msg, dict):
+            continue
+        for fld in ("images", "files"):
+            val = msg.get(fld)
+            if not isinstance(val, list):
+                continue
+            for ai, att in enumerate(val):
+                if isinstance(att, dict):
+                    yield mi, fld, ai, att
+
+
+def _att_index(messages):
+    """Индексы прошлой версии: (индекс сообщения, ключ) -> [записи], ключ -> [записи]."""
+    same, any_ = {}, {}
+    for mi, _fld, _ai, att in _iter_atts(messages):
+        strong, weak = _att_match_keys(att)
+        for key in strong + weak:
+            same.setdefault((mi, key), []).append(att)
+            any_.setdefault(key, []).append(att)
+    return same, any_
+
+
+def _att_unique(recs):
+    """Запись, если под ключом все записи одинаковы; None, если есть различающиеся."""
+    if not recs:
+        return None
+    sig = _att_sig(recs[0])
+    for other in recs[1:]:
+        if _att_sig(other) != sig:
+            return None
+    return recs[0]
+
+
+def _att_consistent(att, cand):
+    """Не противоречат ли надёжные идентификаторы новой записи выбранной записи."""
+    for fld in _ATT_STR_KEYS:
+        a, b = _att_key_val(att.get(fld)), _att_key_val(cand.get(fld))
+        if a and b and a != b:
+            return False
+    return True
+
+
+def _att_match(att, mi, idx_same, idx_any):
+    """Возвращает (запись_из_прошлой_версии | None, признак_спорного_ключа)."""
+    strong, weak = _att_match_keys(att)
+    cands = []
+    for key in strong:
+        recs = idx_same.get((mi, key)) or idx_any.get(key) or []
+        if not recs:
+            continue
+        uniq = _att_unique(recs)
+        if uniq is None:
+            return None, True          # под надёжным id несколько разных записей
+        cands.append(uniq)
+    if cands:
+        chosen = cands[0]
+        for other in cands[1:]:
+            if _att_sig(other) != _att_sig(chosen):
+                return None, True      # надёжные id указывают на разные записи
+        if not _att_consistent(att, chosen):
+            return None, True          # например url совпал, а sha256 противоречит
+        return chosen, False
+    if not strong:
+        # У записи нет надёжных идентификаторов (урезанный payload) — только тогда
+        # доверяем паре kind+name: сначала в том же сообщении, затем по чату.
+        for key in weak:
+            recs = idx_same.get((mi, key)) or idx_any.get(key) or []
+            if not recs:
+                continue
+            uniq = _att_unique(recs)
+            if uniq is None:
+                return None, True      # одинаковое имя+тип — не угадываем
+            return uniq, False
+    return None, False
+
+
+def _att_has_metadata(messages):
+    """Есть ли в записях вложений непустые метаданные (нужно для fail-safe)."""
+    for _mi, _fld, _ai, att in _iter_atts(messages):
+        for f in _ATT_META_FIELDS:
+            if not _att_is_empty(att.get(f)):
+                return True
+    return False
+
+
+def _merge_attachment_metadata(prev_messages, new_messages):
+    """Дописывает в new_messages метаданные из prev_messages.
+
+    Возвращает кортеж (сопоставлено_записей, восстановлено_полей,
+                       защищено_source, спорных_ключей).
+    """
+    idx_same, idx_any = _att_index(prev_messages)
+    matched = restored = src_guarded = ambiguous = 0
+    for mi, _fld, _ai, att in _iter_atts(new_messages):
+        prev_att, спорный = _att_match(att, mi, idx_same, idx_any)
+        if спорный:
+            ambiguous += 1
+            continue
+        if prev_att is None or prev_att is att:
+            continue
+        matched += 1
+        got_url = False
+        for f in _ATT_META_FIELDS:
+            cur = att.get(f)
+            pv = prev_att.get(f)
+            if _att_is_empty(cur):
+                if pv is not None and not _att_is_empty(pv):
+                    att[f] = pv
+                    restored += 1
+                    if f == "url":
+                        got_url = True
+            elif f == "source" and cur == "native" and pv not in (None, "", "native"):
+                att[f] = pv
+                src_guarded += 1
+        # Ссылку восстановили — значит файл в хранилище есть, статус тоже чиним.
+        if got_url and att.get("status") == "missing" and prev_att.get("status") == "available":
+            att["status"] = "available"
+            restored += 1
+    return matched, restored, src_guarded, ambiguous
+
+
 @app.post("/api/chats/{chat_id}")
 async def save_chat(chat_id: str, request: Request):
     """Сохраняет чат (атомарная запись + бэкап)"""
@@ -692,6 +980,79 @@ async def save_chat(chat_id: str, request: Request):
     # Имя файла — источник истины для id
     data["id"] = chat_id
     file_path = CHATS_DIR / f"{chat_id}.json"
+    # Stage 16.4: клиент присылает только известные его схеме поля. Всё, чего в
+    # payload нет (метаданные импортёра v2: branches, importer_version,
+    # parse_report, source_file*, source_observed_hash*, time_confidence,
+    # source_created_at и любые будущие ключи), берём из файла на диске.
+    # Ключи из payload выигрывают — это пользовательские правки (messages,
+    # title, pinned, updated_at и т.д.), их не откатываем.
+    prev = None
+    if file_path.exists():
+        try:
+            prev = json.loads(file_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[WARNING] save_chat: не удалось прочитать старый файл для склейки: {e}")
+    if isinstance(prev, dict):
+        preserved = [k for k in prev if k not in data]
+        if preserved:
+            merged = dict(prev)
+            merged.update(data)
+            data = merged
+            data["id"] = chat_id
+            print(f"[SAVE] Сохранены серверные ключи, которых не было в payload ({len(preserved)}): {preserved}")
+        # Поля происхождения пишет импортёр, клиент их не редактирует. Но объект
+        # чата в UI иногда собран не из полного файла (чат не попал в загруженную
+        # страницу списка), и тогда клиент присылает их как null. Такой null не
+        # должен затирать уже сохранённое значение.
+        _PROVENANCE_KEYS = ("original_id", "source_message_count", "source_content_hash",
+                            "source_content_hash_version", "source_created_at", "source_meta",
+                            "imported_at", "importer_version", "source_updated_at")
+        revived = [k for k in _PROVENANCE_KEYS if data.get(k) is None and prev.get(k) is not None]
+        for k in revived:
+            data[k] = prev[k]
+        if revived:
+            print(f"[SAVE] Поля происхождения не затёрты null'ом ({len(revived)}): {revived}")
+        # Stage 16.5: метаданные вложений (size/mime/sha256/width/... ) клиент не
+        # знает — восстанавливаем их из прошлой версии той же записи до записи файла.
+        # Вызывается ДО бэкапа и до записи. Сохранение отменяется, если в прошлой
+        # версии были метаданные вложений, а сопоставление либо упало, либо дало
+        # спорный ключ (несколько разных записей под одним надёжным id, противоречащие
+        # id, неоднозначная пара kind+name): угадывать соответствие нельзя, иначе на
+        # диск ушла бы потенциально урезанная версия чата. Если метаданных в прошлой
+        # версии не было (обычный чат без вложений) — не блокируем.
+        # Статус отказа 409: повтор того же payload бессмысленен (отказ детерминирован),
+        # и клиент по правилу 4xx не делает повторных POST.
+        if "messages" in data and isinstance(data["messages"], list):
+            prev_msgs = prev.get("messages") or []
+            prev_has_meta = _att_has_metadata(prev_msgs)
+            try:
+                m_att, m_fld, m_src, m_amb = _merge_attachment_metadata(prev_msgs, data["messages"])
+                if m_att or m_amb:
+                    print(f"[SAVE] Вложения: сопоставлено {m_att}, восстановлено полей {m_fld}, "
+                          f"source защищён {m_src}, спорных ключей {m_amb}")
+                if m_amb and prev_has_meta:
+                    print(f"[ERROR] save_chat {chat_id}: сопоставление метаданных вложений "
+                          f"неоднозначно ({m_amb} вложений) — сохранение отменено, "
+                          f"файл {chat_id}.json не изменён")
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(f"Неоднозначное сопоставление вложений: число спорных "
+                                f"вложений {m_amb} — чат не сохранён, прежняя версия файла "
+                                "не изменена; идентификаторы вложений противоречат друг "
+                                "другу, соответствие не угадывалось"))
+            except HTTPException:
+                raise
+            except Exception as e:
+                if prev_has_meta:
+                    print(f"[ERROR] save_chat {chat_id}: слияние метаданных вложений "
+                          f"не удалось ({type(e).__name__}: {e}) — сохранение отменено, "
+                          f"файл {chat_id}.json не изменён")
+                    raise HTTPException(
+                        status_code=409,
+                        detail=("Не удалось сопоставить метаданные вложений — чат не сохранён, "
+                                "прежняя версия файла не изменена"
+                                f" ({type(e).__name__}: {e})"))
+                print(f"[WARNING] save_chat: слияние метаданных вложений не выполнено: {e}")
     # Не терять pinned, если клиент его не прислал (старый клиент / curl)
     if file_path.exists() and "pinned" not in data:
         try:
@@ -717,15 +1078,6 @@ async def save_chat(chat_id: str, request: Request):
         except Exception as e:
             print(f"[WARNING] Backup failed: {e}")
             # Продолжаем, даже если бэкап не удался
-        # --- ВЫТАСКИВАЕМ КАРТИНКИ ИЗ BASE64 ПЕРЕД СОХРАНЕНИЕМ ---
-        if "messages" in data and isinstance(data["messages"], list):
-            try:
-                extracted = _extract_images_from_messages(data["messages"], chat_id, ATTACH_DIR)
-                if extracted > 0:
-                    print(f"[SAVE IMG] Extracted {extracted} images for {chat_id}")
-            except Exception as e:
-                print(f"[SAVE CHAT IMG ERROR] {e}")
-        # ---------------------------------------------------------
     # 2. Атомарная запись
     try:
         fd, tmp_path = tempfile.mkstemp(dir=str(CHATS_DIR), suffix=".tmp")
@@ -1062,6 +1414,26 @@ async def get_attachment(chat_id: str, filename: str):
     return FileResponse(target, media_type=media_type, headers=headers)
 
 # ================= ПАМЯТЬ (PROFILES & PENDING) =================
+# Имя профиля попадает в путь файла, поэтому проверяется на сервере (а не только в
+# редакторе памяти): разрешены только латиница/цифры/«-»/«_», итоговый путь обязан
+# остаться внутри memory/. Иначе — HTTP 400, до любых файловых операций.
+_PROFILE_NAME_RE = re.compile(r"[a-z0-9_-]+", re.IGNORECASE)
+
+def _memory_path(profile: str) -> Path:
+    if not _PROFILE_NAME_RE.fullmatch(profile or ""):
+        raise HTTPException(status_code=400,
+                            detail="Invalid profile name: use letters, digits, '-' or '_'")
+    file_path = MEMORY_DIR / f"{profile}.md"
+    if file_path.parent != MEMORY_DIR:
+        raise HTTPException(status_code=400, detail="Profile path escapes the memory directory")
+    resolved = file_path.resolve()          # снимает симлинки и «..»
+    try:
+        resolved.relative_to(MEMORY_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Profile path escapes the memory directory")
+    return resolved
+
+
 @app.get("/api/memory/profiles")
 async def get_memory_profiles():
     print("[MEMORY] GET profiles")
@@ -1073,7 +1445,7 @@ async def get_memory_profiles():
 @app.get("/api/memory")
 async def get_memory(profile: str = "core"):
     print(f"[MEMORY] GET /api/memory?profile={profile}")
-    file_path = MEMORY_DIR / f"{profile}.md"
+    file_path = _memory_path(profile)
     
     if not file_path.exists():
         # Если файла нет, создаем пустой
@@ -1089,10 +1461,10 @@ async def get_memory(profile: str = "core"):
 @app.post("/api/memory")
 async def save_memory(request: Request, profile: str = "core"):
     print(f"[MEMORY] POST /api/memory?profile={profile}")
+    file_path = _memory_path(profile)
     try:
         data = await request.json()
         content = data.get("content", "")
-        file_path = MEMORY_DIR / f"{profile}.md"
         
         fd, tmp_path = tempfile.mkstemp(dir=str(MEMORY_DIR), suffix=".tmp")
         with os.fdopen(fd, 'w', encoding='utf-8') as tmp_file:
@@ -1115,36 +1487,34 @@ async def get_memory_pending():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/memory/approve")
-async def approve_memory(request: Request, profile: str = "core"):
-    print(f"[MEMORY] POST /api/memory/approve?profile={profile}")
+async def approve_memory(request: Request, profile: str = ""):
+    """Одобрение фактов.
+    Без profile — только удаляет факты из pending (вставку в редактор делает клиент).
+    С profile — прежнее поведение: дописать в файл профиля (совместимость)."""
+    print(f"[MEMORY] POST /api/memory/approve?profile={profile or '(none)'}")
+    file_path = _memory_path(profile) if profile else None
     try:
         data = await request.json()
         approved_facts = data.get("facts", [])
         print(f"[MEMORY] Approving {len(approved_facts)} facts...")
-        
         if not approved_facts:
             return {"status": "ok", "message": "No facts"}
-            
-        file_path = MEMORY_DIR / f"{profile}.md"
-        current_memory = file_path.read_text(encoding="utf-8") if file_path.exists() else f"# Memory: {profile.title()}\n\n"
-        
-        new_lines = []
-        for fact in approved_facts:
-            if fact not in current_memory:
-                new_lines.append(f"- {fact}")
-                
-        if new_lines:
-            with open(file_path, "a", encoding="utf-8") as f:
-                f.write("\n" + "\n".join(new_lines) + "\n")
-            print(f"[MEMORY] Appended {len(new_lines)} lines to {file_path}")
-        else:
-            print("[MEMORY] No new lines (duplicates)")
-                
+        added = 0
+        if profile:
+            current_memory = file_path.read_text(encoding="utf-8") if file_path.exists() else f"# Memory: {profile.title()}\n\n"
+            new_lines = []
+            for fact in approved_facts:
+                if fact not in current_memory:
+                    new_lines.append(f"- {fact}")
+            if new_lines:
+                with open(file_path, "a", encoding="utf-8") as f:
+                    f.write("\n" + "\n".join(new_lines) + "\n")
+                print(f"[MEMORY] Appended {len(new_lines)} lines to {file_path}")
+            added = len(new_lines)
         pending = json.loads(PENDING_FILE.read_text(encoding="utf-8")) if PENDING_FILE.exists() else []
         remaining = [p for p in pending if p.get("fact") not in approved_facts]
         PENDING_FILE.write_text(json.dumps(remaining, ensure_ascii=False, indent=2), encoding="utf-8")
-        
-        return {"status": "ok", "added": len(new_lines)}
+        return {"status": "ok", "added": added, "consumed": len(approved_facts)}
     except Exception as e:
         print(f"[MEMORY ERROR] Approve failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1293,7 +1663,7 @@ async def profile_route(req: RouteProfileRequest):
 
 
 @app.post("/api/profile/build-from-current")
-async def build_from_current_profile(name: str | None = None, budget: int = 4000, min_generic: int = 1):
+async def build_from_current_profile(name: str | None = None, budget: int = 4000, min_generic: int = 1, model: str | None = None):
     path = PROFILES_DIR / "current.json"
     if not path.exists():
         raise HTTPException(status_code=404, detail="No routed profile. Call /api/profile/route first.")
@@ -1325,12 +1695,14 @@ async def build_from_current_profile(name: str | None = None, budget: int = 4000
         cmd += ["--exclude", ",".join(excludes)]
     # ВСЕГДА, независимо от наличия exclude:
     cmd += ["--dry-run", "--budget", str(budget), "--min-generic", str(min_generic)]
+    cmd += ["--model", model or "local-model"] # <--- ДОБАВИТЬ
 
     print(f"[PROFILE] build-from-current: {' '.join(cmd)}")
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(BASE_DIR),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
         stdout, stderr = await process.communicate()
     except Exception as e:
@@ -1354,6 +1726,7 @@ class BuildProfileRequest(BaseModel):
     anchor: str
     min_generic: int = 2
     budget: int = 4000
+    model: str | None = None  # <--- ДОБАВИТЬ
 
 @app.post("/api/memory/build-profile")
 async def build_profile(req: BuildProfileRequest):
@@ -1366,13 +1739,22 @@ async def build_profile(req: BuildProfileRequest):
         raise HTTPException(status_code=500, detail="profile-builder1.4.py not found in BASE_DIR")
 
     # Собираем команду (всегда dry-run для предпросмотра)
+    def _kw(raw: str) -> str:
+        # Билдер делит ключи только по запятым. Разрешаем и ";" (многословные фразы),
+        # а если запятых/точек с запятой нет вовсе — считаем разделителем пробел.
+        parts = re.split(r"[;,]", raw or "")
+        if len([p for p in parts if p.strip()]) <= 1:
+            parts = (raw or "").split()
+        return ",".join(p.strip() for p in parts if p.strip())
+
     cmd = [
         sys.executable, str(script_path), 
-        req.name, req.keywords,
-        "--anchor", req.anchor,
+        req.name, _kw(req.keywords),
+        "--anchor", _kw(req.anchor),
         "--min-generic", str(req.min_generic),
         "--budget", str(req.budget),
-        "--dry-run"
+        "--dry-run",
+        "--model", req.model or "local-model"  # <--- ДОБАВИТЬ
     ]
 
     print(f"[BUILD] Starting: {' '.join(cmd)}")
@@ -1382,7 +1764,8 @@ async def build_profile(req: BuildProfileRequest):
             *cmd,
             cwd=str(BASE_DIR),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
         stdout, stderr = await process.communicate()
         
@@ -1390,6 +1773,12 @@ async def build_profile(req: BuildProfileRequest):
         err = stderr.decode('utf-8', errors='ignore')
         
             
+        if process.returncode != 0:
+            reason = next((l for l in reversed((err or out).strip().splitlines()) if l.strip()), "Unknown error")
+            print(f"[BUILD] exit={process.returncode} stderr:\n{err.strip() or '(empty)'}")
+            raise HTTPException(status_code=500,
+                                detail=f"Builder failed (exit {process.returncode}): {reason[:400]}")
+
         # Вытаскиваем Markdown между маркерами (учитываем любые переносы строк)
         match = re.search(r"--- DRY RUN OUTPUT ---(.*?)--- END ---", out, re.DOTALL)
         if match:

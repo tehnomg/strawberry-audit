@@ -462,6 +462,7 @@ def main():
         f"Тема профиля: {profile_name}\n"
         f"Сильные ключи (anchor): {', '.join(anchor_keywords) if anchor_keywords else '(не заданы)'}\n"
         f"Общие ключи: {', '.join(generic_keywords)}\n\n"
+        f"ОГРАНИЧЕНИЕ: Постарайся сделать текст компактным, не более {args.budget} символов. Если фактов много — выбери самые важные.\n\n"
         f"Список фактов ({len(relevant)} штук):\n{facts_text}"
     )
 
@@ -478,8 +479,8 @@ def main():
         # Strata берёт reasoning_effort, llama.cpp / LM Studio игнорируют
         # (reasoning там задан на сервере при загрузке модели).
         "reasoning_effort": "none",
-        "enable_thinking": False,
-        "reasoning_budget_tokens": 0,
+        # "enable_thinking": False,
+        # "reasoning_budget_tokens": 0,
     }
     if args.frequency_penalty != 0:
         payload["frequency_penalty"] = args.frequency_penalty
