@@ -79,7 +79,7 @@ function showTab(name) {
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
-  if (tab === "monitor" && !isStrata()) checkMonitorStatus();
+  if (tab === "monitor" && !supportsMetrics()) checkMonitorStatus();
   if (tab === "about") loadConfig();
   if (lastMetrics) render(lastMetrics);
 }
@@ -97,24 +97,63 @@ function headers(json = false) {
 $("api-key").value = store.get("apikey", "");
 $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
 
-let health = {model: "strata", images: false, max_context: 0};
+let health = {model: "", images: null, max_context: 0};   // только для подключения «этот сервер»
 
-async function loadHealth() {
-  if (!isStrata()) {
-    window.health = health;
-    updateAttachBtnTitle();
-    return;
-  }
-  try {
-    health = await (await fetch("health")).json();
-    window.health = health;
-    updateAttachBtnTitle();
-    $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
-  } catch (e) {
-    setTimeout(loadHealth, 2000);
-  }
+// Проба vision: сервер сам отвечает на крошечный запрос с картинкой (макс. 4 токена).
+// Решение запоминается за подключением (Connections.setFlag), повторных запросов нет.
+// Делается только для подключений Strata: у llama.cpp vision сообщается в /props,
+// у LM Studio — в каталоге, а для неизвестного OpenAI-сервера остаётся ручной тумблер.
+const VISION_PROBE_PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAABQABh8QJcwAAAABJRU5ErkJggg==";
+
+async function probeVision(conn, modelId) {
+  if (!conn || !modelId) return null;
+  const known = Connections.caps(conn, modelId).vision;
+  if (known !== null) { health.images = known; window.health = health; updateAttachBtnTitle(); return known; }
+  const kind = conn.kind;
+  if (kind !== "strata" && kind !== "strata2") return null;      // не запускаем лишнюю генерацию на чужих серверах
+  const r = await Transport.completionOnce({
+    conn, timeout: 15000,
+    body: {model: modelId, stream: false, max_tokens: 4, messages: [{role: "user", content: [
+      {type: "text", text: "vision probe"},
+      {type: "image_url", image_url: {url: VISION_PROBE_PNG}},
+    ]}]},
+  });
+  let images = null;
+  if (r.ok) images = true;                                       // принял картинку
+  else if (/image|vision|modal/i.test(r.error || "")) images = false;  // 400 «does not support images»
+  if (images === null) return null;                              // сервер недоступен — решение не принимаем
+  Connections.setFlag(conn.id, "vision", images);
+  health.images = images;
+  window.health = health;
+  updateAttachBtnTitle();
+  if (images) toast("success", "Vision available", `${modelId} accepts images - pictures can be attached.`);
+  return images;
 }
 
+// health нужен интерфейсу (подпись пустого чата, тумблер картинок). Берётся из активного
+// подключения; для внешних серверов /health этого origin к ним отношения не имеет.
+async function loadHealth() {
+  const conn = Connections.active();
+  if (!conn) { window.health = health; return; }
+  const model = Connections.selectedModel(conn);
+  const info = Connections.byModel(conn, model);
+  if (conn.base === "") {
+    const h = await Transport.json(conn, "/health", { timeout: 4000 });
+    if (h.ok && h.json && typeof h.json === "object") health = h.json;
+    else health = { model: model || "", images: null, max_context: (info && info.ctx && info.ctx.max) || 0 };
+    if (typeof health.images !== "boolean" && model) await probeVision(conn, model);
+  } else {
+    health = { model: model || "", images: null, max_context: (info && info.ctx && info.ctx.max) || 0 };
+  }
+  if (!health.model && model) health.model = model;
+  window.health = health;
+  updateAttachBtnTitle();
+  const sub = $("chat-empty-sub");
+  if (sub) {
+    if (conn.base === "" && health.model) sub.textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+    else if (health.model) sub.textContent = `${health.model} · ${conn.name} (${conn.base})`;
+  }
+}
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
   {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
@@ -161,13 +200,9 @@ let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
 
 async function poll() {
-  if (!isStrata()) {
-    // Если детектор уже понял, что сервер офлайн, poll не должен трогать статус
-    if (lastDetected && lastDetected.status === "error") {
-        setTimeout(poll, 5000);
-        return;
-    }
-
+  if (!supportsMetrics()) {
+    // Метрики относится к этому origin; для внешних подключений poll не трогает
+    // статус, а монитор показывает состояние активного подключения.
     if (tab === "monitor" && Date.now() - (__monitorStatus.lastCheck || 0) > 5000) {
       checkMonitorStatus();
     }
@@ -202,7 +237,7 @@ function setPill(state, text) {
 
 function render(m) {
   if (!m) return;
-  if (tab === "monitor" && !isStrata()) { renderMonitorPlaceholder(); return; }
+  if (tab === "monitor" && !supportsMetrics()) { renderMonitorPlaceholder(); return; }
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || [])[0];
   // the header pill
@@ -223,119 +258,62 @@ function render(m) {
 
 let __monitorStatus = { state: "unknown", count: 0, lastCheck: 0, error: null };
 
-let lastDetected = null;
-let lastMismatchProvider = null;
+// ---------------------------------------------------------------- статус подключения
+// Пингуем ТОЛЬКО активное подключение. Если оно недоступно — интерфейс уходит в
+// read-only; ни на какой другой сервер приложение не переключается и каталоги
+// других подключений не обновляет (решение о смене принимает только пользователь).
+let lastConnState = null;
 
-async function runBackendCheck() {
-  if (!window.BackendDetector) {
-    setPill("error", "Detector missing");
-    return; 
-  }
-  
-  const currentProv = getP().id;
-  const currentBaseUrl = providerSettings.base_url || getP().defaultBaseUrl || "";
+function connLabel(conn) { return `${conn.name} · ${Providers.labelOf(conn.kind)}`; }
+
+function setReadOnly(on) {
   const input = $("input");
   const sendBtn = $("send-btn");
-
-  // 1. ЗАЩИТА ТЕРРИТОРИИ (Восстановление прошлой сессии)
-  // Проверяем ТОЛЬКО того провайдера, которого мы сохранили в localStorage.
-  
-  if (currentProv === "strata") {
-    try {
-      const h = await fetch("health", {signal: AbortSignal.timeout(2000)});
-      if (h.ok) {
-         const healthData = await h.json();
-         window.health = healthData;
-         if (input) { input.disabled = false; input.placeholder = "Ask anything…"; }
-         if (sendBtn) sendBtn.disabled = false;
-         setPill("idle", `strata · ${healthData.model || "native"}`);
-         return; // Strata жива, всё отлично. Игнорируем чужаков.
-      }
-    } catch (e) { /* Strata умерла, идём искать */ }
-  } 
-  else if (currentProv === "lmstudio" || currentProv === "llamacpp") {
-    try {
-       const r = await fetch(`/api/proxy/v1/models?base=${encodeURIComponent(currentBaseUrl)}`, {signal: AbortSignal.timeout(2000)});
-       if (r.ok) {
-           if (input) { input.disabled = false; input.placeholder = "Ask anything…"; }
-           if (sendBtn) sendBtn.disabled = false;
-           setPill("idle", `${getP().label} · ${providerSettings.model_id || "unknown"}`);
-           
-           // Если это LM Studio и модель не выбрана — автоматически открываем About для JIT-загрузки!
-           if (currentProv === "lmstudio" && !providerSettings.model_id && tab !== "about") {
-               showTab("about");
-               toast("warn", "Выберите модель", "Модель не выбрана. Нажмите Refresh в настройках LM Studio.", 6000);
-           }
-           return; // Текущий внешний сервер жив, не трогаем его.
-       }
-    } catch (e) { /* Внешний сервер умер, идём искать */ }
+  if (input) {
+    input.disabled = !!on;
+    input.placeholder = on ? "Режим чтения (подключение недоступно)" : "Ask anything…";
   }
+  if (sendBtn) sendBtn.disabled = !!on;
+  if (on) setPill("queued", "Read-only (offline)");
+}
 
-  // 2. ЕСЛИ СТАРЫЙ СЕРВЕР УМЕР — ИЩЕМ НОВЫХ
-  const res = await window.BackendDetector.detect(currentBaseUrl);
-  
-  if (res.status === "error") {
-    if (input) { input.disabled = true; input.placeholder = "📖 Режим чтения (сервер офлайн)"; }
-    if (sendBtn) sendBtn.disabled = true;
-    setPill("queued", "Read-only (offline)"); 
+async function updateConnectionStatus() {
+  const conn = Connections.active();
+  if (!conn) { setPill("error", "Нет подключения"); return; }
+  const r = await Connections.ping(conn.id);
+  const was = lastConnState;
+  lastConnState = r.ok ? "ok" : "error";
+  if (!r.ok) {
+    setReadOnly(true);
+    if (was !== "error") toast("error", "Подключение недоступно", `${conn.name}: ${r.error || "нет ответа"}`, 6000);
+    __monitorStatus = { state: "disconnected", count: conn.catalog.length, lastCheck: Date.now(), error: r.error || "unreachable" };
+    if (tab === "monitor" && !supportsMetrics()) renderMonitorPlaceholder();
     return;
   }
-
-  if (input) { input.disabled = false; input.placeholder = "Ask anything…"; }
-  if (sendBtn) sendBtn.disabled = false;
-
-  // Если провайдер реально сменился — сбрасываем старую модель, чтобы не было Франкенштейна
-  if (res.provider !== currentProv) {
-     providerSettings.model_id = "";
-     store.set("model_id", "");
-     if ($("prov-model")) $("prov-model").value = "";
-
-     store.set("provider", res.provider);
-     providerSettings.provider = res.provider;
-     if ($("prov-select")) $("prov-select").value = res.provider;
-
-     if (res.detectedUrl) {
-        providerSettings.base_url = res.detectedUrl;
-        store.set("base_url", res.detectedUrl);
-        if ($("prov-base")) $("prov-base").value = res.detectedUrl;
-     }
-     
-     if (res.provider === "strata") {
-        loadHealth();
-        toast("success", "Переключено на Strata", "Модель подхвачена автоматически.");
-     } else if (res.provider === "llamacpp") {
-        toast("success", "Переключено на llama.cpp", "Загружаем список моделей...");
-        if ($("prov-refresh")) setTimeout(() => $("prov-refresh").click(), 500);
-     } else if (res.provider === "lmstudio") {
-        if (tab !== "about") showTab("about");
-        toast("warn", "LM Studio подключен", "Выберите модель в настройках.", 8000);
-        if ($("prov-refresh")) setTimeout(() => $("prov-refresh").click(), 300);
-     }
-  }
+  if (was === "error") toast("success", "Подключение снова доступно", connLabel(conn), 4000);
+  setReadOnly(false);
+  const model = Connections.selectedModel(conn);
+  setPill("idle", model ? `Idle · ${model}` : `${connLabel(conn)} — выберите модель`);
+  __monitorStatus = { state: "connected", count: conn.catalog.length, lastCheck: Date.now(), error: null };
+  if (tab === "monitor" && !supportsMetrics()) renderMonitorPlaceholder();
 }
 
 async function checkMonitorStatus() {
-  const p = getP();
-  if (p.id === "strata") return;
-  const base = providerSettings.base_url || store.get("base_url", "") || p.defaultBaseUrl;
-  try {
-    const r = await fetch(`/api/proxy/v1/models?base=${encodeURIComponent(base)}`,
-                          {signal: AbortSignal.timeout(5000)});
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j = await r.json();
-    const list = Array.isArray(j.data) ? j.data : (Array.isArray(j.models) ? j.models : []);
-    __monitorStatus = { state: "connected", count: list.length, lastCheck: Date.now(), error: null };
-  } catch (e) {
-    __monitorStatus = { state: "disconnected", count: 0, lastCheck: Date.now(), error: String(e.message || e) };
-  }
-  if (tab === "monitor" && !isStrata()) renderMonitorPlaceholder();
+  const conn = Connections.active();
+  if (!conn) return;
+  const r = await Providers.ping(conn);
+  if (r.ok) __monitorStatus = { state: "connected", count: conn.catalog.length, lastCheck: Date.now(), error: null };
+  else __monitorStatus = { state: "disconnected", count: 0, lastCheck: Date.now(), error: r.error || "unreachable" };
+  if (tab === "monitor" && !supportsMetrics()) renderMonitorPlaceholder();
 }
 
 function renderMonitorPlaceholder() {
-  const p = getP();
-  const providerLabel = p.label;
-  const modelId = store.get("model_id", "") || "(no model selected)";
-  const base = providerSettings.base_url || store.get("base_url", "") || p.defaultBaseUrl || "(default)";
+  const conn = Connections.active() || null;
+  const connName = (conn && conn.name) || "—";
+  const kindLabel = Providers.labelOf((conn && conn.kind) || "openai");
+  const kindState = (conn && conn.kindState) || "unverified";
+  const modelId = (conn ? Connections.selectedModel(conn) : "") || "(модель не выбрана)";
+  const base = (!conn) ? "—" : (conn.base === "" ? "этот сервер" : conn.base);
   const st = __monitorStatus || { state: "unknown", count: 0, error: null };
 
   const stateLabel = st.state === "connected" ? "Connected"
@@ -349,19 +327,20 @@ function renderMonitorPlaceholder() {
   $("metrics").innerHTML =
     `<div class="st-card" style="grid-column:1/-1;display:flex;flex-direction:column;gap:12px;">
       <div style="display:flex;justify-content:space-between;align-items:center;">
-        <span class="card-title">Provider status</span>
+        <span class="card-title">Статус подключения</span>
         <button class="st-btn st-btn--secondary" id="monitor-refresh" type="button">Refresh</button>
       </div>
       <dl class="facts">
-        <dt>Provider</dt><dd>${esc(providerLabel)}</dd>
+        <dt>Подключение</dt><dd>${esc(connName)}</dd>
+        <dt>Тип</dt><dd>${esc(kindLabel)} · ${esc(kindState)}</dd>
         <dt>Base URL</dt><dd><code>${esc(base)}</code></dd>
-        <dt>Model</dt><dd>${esc(modelId)}</dd>
+        <dt>Модель</dt><dd>${esc(modelId)}</dd>
         <dt>Status</dt><dd><span class="st-badge ${stateClass}">${esc(stateLabel)}</span></dd>
-        <dt>Models found</dt><dd>${st.count}</dd>
+        <dt>Моделей в каталоге</dt><dd>${st.count}</dd>
         <dt>Last check</dt><dd>${lastCheck}</dd>
       </dl>
       ${st.error ? `<p class="msg-error">${esc(st.error)}</p>` : ""}
-      <p class="muted small">Live metrics are available only with Strata. This panel shows connection status for the current external provider.</p>
+      <p class="muted small">Живые метрики доступны только для движка Strata. Здесь показывается состояние активного подключения.</p>
     </div>`;
 
   $("state-label").textContent = "—";
@@ -590,6 +569,8 @@ async function loadMcp() {
   try {
     const r = await fetch("mcp", {headers: headers()});
     if (!r.ok) return;
+	const ct = r.headers.get("content-type") || "";
+    if (!ct.includes("application/json")) return; // <--- ЗАЩИТА ОТ HTML
     mcpInfo = await r.json();
   } catch (e) { return; /* an older server: no MCP */ }
   renderMcp();
@@ -626,6 +607,8 @@ async function loadConfig() {
   let r;
   try { r = await fetch("config", {headers: headers()}); } catch (e) { return; }
   if (!r.ok) { $("cfg-card").hidden = true; return; }       // no run config, an older server, or no key yet
+  const ct = r.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) { $("cfg-card").hidden = true; return; } // <--- ЗАЩИТА ОТ HTML
   const c = await r.json();
   cfgKeys = c.keys || [];
   $("cfg-file").textContent = c.file || "";
@@ -748,13 +731,15 @@ function markdown(text) {
 const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
 // BEFORE (line ~...): let settings = {...DEFAULTS, ...store.get("sampling", {})};
 // AFTER: add right below
-const providerSettings = {
-  provider: store.get("provider", "strata"),
-  base_url: store.get("base_url", ""),
-  model_id: store.get("model_id", ""),
-};
-function getP() { return window.Providers.getProvider(store.get("provider", "strata")); }
-function isStrata() { return store.get("provider", "strata") === "strata"; }
+// ---------------------------------------------------------------- активное подключение
+// Всё состояние подключений живёт в connections.js; здесь только короткие читалки.
+function conn() { return Connections.active(); }
+function isStrata() { const c = conn(); return !!c && (c.kind === "strata" || c.kind === "strata2"); }
+function currentModelId() { const c = conn(); return c ? Connections.selectedModel(c) : ""; }
+// Живые метрики (/metrics) отдаёт только движок этого сервера (route /metrics в
+// history-server.py). У внешнего подключения их получить нельзя, поэтому Monitor
+// показывает панель состояния активного подключения.
+function supportsMetrics() { const c = conn(); return !!c && c.base === ""; }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
 let messages = store.get("chat", []);
 let attachments = [];                 // {name, url}
@@ -764,24 +749,31 @@ let busy = null;                      // {controller, msg}
 let memoryEnabled = store.get("memory_enabled", false);
 let memoryText = "";
 // ===========================
+// Вложения сохраняем полными записями. Импортёр пишет в них поля происхождения и
+// описания файла (source, source_id, source_ref, url, sha256, size, mime,
+// declared_mime, format_hint, width, height, library_file_id, kind, status, text).
+// Старый узкий шаблон ({name,url,status} для картинок и {name,text,status} для
+// файлов) терял эти поля уже в localStorage: после перезагрузки страницы в
+// messages попадали урезанные записи, они уходили на сервер через syncCurrentHistory
+// и затирали полные данные в файле чата (в том числе url у документов и
+// source=chatgpt -> source=native). Поэтому запись копируется целиком, а значения
+// по умолчанию подставляются только там, где поля и так не было.
 function saveChat() {
   store.set("chat", messages.map((m) => ({
     ...m, 
-    images: (m.images || []).map((i) => ({name: i.name, url: i.url, status: i.status})),
-    files: (m.files || []).map((f) => ({name: f.name, text: f.text, status: f.status}))
+    images: (m.images || []).map((i) => ({...i, kind: i.kind || "image"})),
+    files: (m.files || []).map((f) => ({...f, kind: f.kind || "file"}))
   })));
 }
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
 function buildMeta(m) {
   const bits = [];
-  // Для сообщений, где model не записан, берем из настроек
-  const effectiveModel = m.model 
-                       || window.__lastResponseModel
-                       || window.health?.model
-                       || (getP().id !== "strata" ? providerSettings.model_id : "")
-                       || "";
-  if (effectiveModel) bits.push(effectiveModel);
+  // Модель в сигнатуре сообщения — только та, которую сообщил сервер в ответе (m.model).
+  // Запрошенную (m.requestedModel) вместо неё не подставляем: если сервер ничего не
+  // сообщил, пишем «модель не сообщена».
+  if (m.model) bits.push(m.model);
+  else if (m.modelReported === false) bits.push("модель не сообщена");
   if (m.tokens != null) bits.push(`${fmt(m.tokens)} tokens`);
   if (m.tokPerSec != null && m.tokPerSec > 0.25) bits.push(`${fmt(m.tokPerSec, 1)} tok/s`);
   if (m.stopped) bits.push("stopped");
@@ -790,6 +782,36 @@ function buildMeta(m) {
   if (bits.length) return bits.join(" · ");
   if (m.meta) return m.meta;
   return "—";
+}
+
+// --- вложения: подпись, размер и безопасная ссылка --------------------------
+// href присваиваем через DOM-свойство: пробелы и спецсимволы в имени/пути
+// браузер кодирует сам, ручное encodeURIComponent ломало бы уже готовые url.
+function attHref(a) {
+  const u = (a && typeof a.url === "string") ? a.url.trim() : "";
+  if (!u) return "";
+  if (u.startsWith("/api/attachments/") || u.startsWith("/api/files/")) return u;
+  if (/^(https?:|data:)/i.test(u)) return u;
+  return "";                       // javascript:, //host, мусор — ссылку не делаем
+}
+function attLabel(a, fallback) {
+  return String((a && (a.name || a.source_id || a.source_ref)) || fallback);
+}
+function attSizeText(a) {
+  const b = Number(a && a.size);
+  if (!isFinite(b) || b <= 0) return "";
+  if (b < 1024) return `${b} Б`;
+  if (b < 1048576) return `${(b / 1024).toFixed(1)} КБ`;
+  return `${(b / 1048576).toFixed(1)} МБ`;
+}
+function attTitle(a, href) {
+  const bits = [attLabel(a, "вложение")];
+  const sz = attSizeText(a);
+  if (sz) bits.push(sz);
+  if (a && (a.mime || a.declared_mime)) bits.push(a.mime || a.declared_mime);
+  if (a && a.width && a.height) bits.push(`${a.width}×${a.height}`);
+  if (!href) bits.push("файл не перенесён в хранилище");
+  return bits.join(" · ");
 }
 
 function msgEl(m, i) {
@@ -801,10 +823,22 @@ function msgEl(m, i) {
       const wrap = document.createElement("div");
       wrap.className = "msg-images";
       for (const f of m.files) {
-        const c = document.createElement("span");
-        c.className = "chip";
+        const href = attHref(f);
+        const label = attLabel(f, "файл");
+        const c = document.createElement(href ? "a" : "span");
+        c.className = href ? "chip chip--link" : "chip";
+        if (href) {
+          c.href = href;                 // локальный URL Strawberry
+          c.setAttribute("download", label);  // исходное имя при скачивании
+          c.target = "_blank";
+          c.rel = "noopener";
+        }
+        c.title = attTitle(f, href);
         c.innerHTML = icon("attach", "st-icon st-icon--sm");
-        c.append(f.name);
+        const nm = document.createElement("span");
+        nm.className = "chip-name";
+        nm.textContent = label;
+        c.appendChild(nm);
         wrap.appendChild(c);
       }
       el.appendChild(wrap);
@@ -813,19 +847,33 @@ function msgEl(m, i) {
       const wrap = document.createElement("div");
       wrap.className = "msg-images";
       for (const im of m.images) {
-                        if (im.url) { 
-                    const img = document.createElement("img"); 
-                    img.src = im.url; 
-                    img.alt = im.name || "image"; 
-                    img.style.maxWidth = "100%"; 
-                    img.style.maxHeight = "300px"; // Ограничение по высоте
-                    img.style.borderRadius = "8px"; 
-                    img.style.objectFit = "contain";
-                    img.style.display = "block";
-                    img.style.marginTop = "8px";
-                    wrap.appendChild(img); 
-                }
-        else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || "image"); wrap.appendChild(c); }
+        const href = attHref(im) || (im.url ? String(im.url) : "");
+        if (href) {
+          const link = document.createElement("a");
+          link.className = "msg-images__img";
+          link.href = href;
+          link.target = "_blank";
+          link.rel = "noopener";
+          link.title = attTitle(im, href);
+          const img = document.createElement("img");
+          img.src = href;
+          img.alt = attLabel(im, "image");
+          img.style.maxWidth = "100%";
+          img.style.maxHeight = "300px"; // Ограничение по высоте
+          img.style.borderRadius = "8px";
+          img.style.objectFit = "contain";
+          img.style.display = "block";
+          img.style.marginTop = "8px";
+          link.appendChild(img);
+          wrap.appendChild(link);
+        } else {
+          const c = document.createElement("span");
+          c.className = "chip";
+          c.innerHTML = icon("image", "st-icon st-icon--sm");
+          c.append(attLabel(im, "image"));
+          c.title = attTitle(im, "");
+          wrap.appendChild(c);
+        }
       }
       el.appendChild(wrap);
     }
@@ -1098,9 +1146,111 @@ $("chat").addEventListener("toggle", (e) => {
   if (d.open && body.dataset.pending) { body.textContent = messages[+d.closest(".st-msg").dataset.i].reasoning; delete body.dataset.pending; }
 }, true);
 
-function apiMessages() {
+// ====================== ИЗОБРАЖЕНИЯ: image_url под конкретный провайдер ======================
+// Этап 11. Относительный путь (/api/attachments/...) бэкенд не понимает: ответ
+// "an image must be a data: URL, an http(s) URL or a local file path". Локальному провайдеру
+// отдаём абсолютный http://127.0.0.1:PORT/... (он скачает сам), внешнему - только data: URL
+// либо публичный https. Локальный адрес внешнему API безусловно не передаётся.
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+const IMAGE_CDN_HOSTS = new Set(["images.openai.com", "files.deepseeksvc.com"]);   // whitelist markdown-картинок
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+const MAX_IMAGES_PER_MESSAGE = 4;
+const imageDataUrlCache = new Map();
+
+function hostOf(u) {
+  try { return (new URL(u, location.origin)).hostname.toLowerCase(); } catch (e) { return ""; }
+}
+function absUrl(u) {
+  try { return (new URL(u, location.origin)).href; } catch (e) { return null; }
+}
+function isLoopbackUrl(u) { return LOOPBACK_HOSTS.has(hostOf(u)); }
+
+// Локальность определяется по адресу подключения: "" = тот же origin, что и UI,
+// иначе — loopback-хост из base. Тип подключения на это не влияет.
+function isLocalConn(c) {
+  if (!c) return false;
+  if (c.base === "") return true;
+  try { return LOOPBACK_HOSTS.has(new URL(/^https?:\/\//i.test(c.base) ? c.base : "http://" + c.base).hostname.toLowerCase()); }
+  catch (e) { return false; }
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result));
+    r.onerror = () => rej(new Error("read failed"));
+    r.readAsDataURL(blob);
+  });
+}
+
+// строка для image_url.url либо null (причина уходит в warns)
+function fmtMB(n) { return (Math.round(n / 104857.6) / 10).toFixed(1) + " МБ"; }
+async function imagePayloadFor(raw, local, warns) {
+  if (typeof raw !== "string" || !raw) return null;
+  if (raw.startsWith("data:image/")) {
+    if (local) return raw;
+    const approx = Math.floor((raw.length - raw.indexOf(",") - 1) * 3 / 4);   // байт в data URL ~3/4 символов
+    if (approx > MAX_IMAGE_BYTES) {
+      warns.push("внешнему провайдеру нельзя картинку " + fmtMB(approx) + " (лимит " + fmtMB(MAX_IMAGE_BYTES) + ")");
+      return null;
+    }
+    return raw;
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw) && !/^https?:/i.test(raw)) return null;  // file-service://, sediment://, голый id
+  const url = absUrl(raw);
+  if (!url) return null;
+  const loop = isLoopbackUrl(url);
+  if (local && loop) return url;          // локальный бэкенд достанет сам
+  if (!loop) return url;                  // публичный http(s) - отдаём как есть
+  if (imageDataUrlCache.has(url)) return imageDataUrlCache.get(url);
+  try {
+    const r = await fetch(url);
+    if (!r.ok) { warns.push("картинка недоступна: HTTP " + r.status); return null; }
+    const blob = await r.blob();
+    if (blob.type && blob.type.indexOf("image/") !== 0) {
+      warns.push("ссылка ведёт не на изображение (" + blob.type + ")");
+      return null;
+    }
+    if (blob.size > MAX_IMAGE_BYTES) {
+      warns.push("внешнему провайдеру нельзя картинку " + fmtMB(blob.size) + " (лимит " + fmtMB(MAX_IMAGE_BYTES) + ")");
+      return null;
+    }
+    const du = await blobToDataUrl(blob);
+    imageDataUrlCache.set(url, du);
+    return du;
+  } catch (e) {
+    warns.push("не удалось прочитать картинку: " + (e && e.message ? e.message : e));
+    return null;
+  }
+}
+
+// ![alt](target) в текст сообщения - это картинка в UI, но не в запросе. Выделяем разрешённые
+// ссылки в image_url, в тексте оставляем alt; декоративные ссылки (бейджи и т.п.) не трогаем.
+function splitMarkdownImages(text) {
+  const urls = [];
+  if (!text || text.indexOf("![") < 0) return {text: text || "", urls};
+  const cleaned = text.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (whole, alt, target) => {
+    const t = String(target || "").trim();
+    let keep = t.indexOf("/api/attachments/") === 0;
+    if (!keep && /^https?:/i.test(t)) keep = IMAGE_CDN_HOSTS.has(hostOf(t));
+    if (!keep) return whole;
+    urls.push(t);
+    return alt ? alt : "";
+  });
+  return {text: cleaned, urls};
+}
+
+function imageKey(u) {
+  if (typeof u !== "string" || !u) return "";
+  if (u.indexOf("data:") === 0) return "data:" + u.length + ":" + u.slice(0, 60);
+  return absUrl(u) || u;
+}
+
+async function apiMessages() {
   const out = [];
-  
+  const local = isLocalConn(conn());
+  const warns = [];
+
   if (memoryEnabled) {
     const parts = [];
     
@@ -1124,14 +1274,36 @@ function apiMessages() {
   // ========================  
   for (const m of messages) {
     if (m.role === "user") {
-      const imgs = (m.images || []).filter((i) => i.url);
-      const text = userText(m);
+      const imgs = [];
+      const sentKeys = new Set();
+      for (const im of (m.images || [])) {
+        const key = imageKey(im.url);
+        if (!key || sentKeys.has(key)) continue;
+        const payload = await imagePayloadFor(im.url, local, warns);
+        if (!payload) continue;
+        sentKeys.add(key);
+        if (imgs.length < MAX_IMAGES_PER_MESSAGE) imgs.push(payload);
+      }
+      // Markdown-картинки уходят в запрос только если vision включён (иначе модель их всё равно не примет)
+      const md = visionEnabled() ? splitMarkdownImages(m.text || "") : {text: m.text || "", urls: []};
+      for (const t of md.urls) {
+        if (imgs.length >= MAX_IMAGES_PER_MESSAGE) break;
+        const key = imageKey(t);
+        if (!key || sentKeys.has(key)) continue;
+        const payload = await imagePayloadFor(t, local, warns);
+        if (!payload) continue;
+        sentKeys.add(key);
+        imgs.push(payload);
+      }
+      const filesText = userText({text: "", files: m.files});   // те же блоки приложенных текстов, что и раньше
+      const text = [md.text, filesText].filter((s) => s).join("\n\n");
       out.push({role: "user", content: imgs.length ? [{type: "text", text},
-        ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}}))] : text});
+        ...imgs.map((u) => ({type: "image_url", image_url: {url: u}}))] : text});
     } else if (!(busy && busy.msg === m)) {            // the answer being asked for now is not history yet
       out.push(...assistantMessages(m));
     }
   }
+  if (warns.length) toast("warn", "Изображения не отправлены", [...new Set(warns)].slice(0, 3).join("; "));
   return out;
 }
 // An answer that used MCP tools goes back as the model wrote it: per round the text before the calls, the calls and
@@ -1171,22 +1343,12 @@ async function send() {
   const text = $("input").value.trim();
   if ((!text && !attachments.length) || busy) return;
 
-  const p = getP();
-
-  // PR-1: внешний провайдер без выбранной модели — не отправляем
-  if (p.id !== "strata" && !providerSettings.model_id) {
-    toast("warn", "No model selected", "Choose a model under About > LLM provider.");
+  const c0 = conn();
+  if (!c0) { toast("warn", "Нет подключения", "Добавьте подключение: About > Подключения."); return; }
+  if (c0.state === "error") { toast("warn", "Подключение недоступно", `${c0.name}: ${c0.lastError || "нет ответа"}`, 6000); return; }
+  if (!Connections.selectedModel(c0)) {
+    toast("warn", "Модель не выбрана", `Укажите модель для «${c0.name}»: About > Подключения.`, 6000);
     return;
-  }
-
-  // Синхронизируем настройки из UI (пользователь мог напечатать и не нажать Enter/Tab)
-  if (p.id !== "strata") {
-    const base = $("prov-base").value.trim() || providerSettings.base_url || p.defaultBaseUrl;
-    const model = $("prov-model").value.trim() || providerSettings.model_id;
-    providerSettings.base_url = base;
-    providerSettings.model_id = model;
-    store.set("base_url", base);
-    store.set("model_id", model);
   }
 
   messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
@@ -1204,20 +1366,32 @@ async function send() {
 }
 
 async function streamAnswer(m, el) {
-  const p = getP();
+  const c = conn();
   const controller = new AbortController();
   busy = {controller, msg: m};
   setBusy(true);
 
   // ---- Сборка тела запроса ----
+  // Модель берём только из активного подключения: чужая модель или модель из health
+  // сюда не попадает. requestedModel — что отправили; model — что сообщил сервер.
+  const modelId = Connections.selectedModel(c);
+  m.requestedModel = modelId || null;
+
   const body = {
-    model: p.id === "strata"
-      ? (health.model || "strata")
-      : providerSettings.model_id,
-    messages: apiMessages(),
+    model: modelId,
+    messages: await apiMessages(),
     stream: true,
   };
-  if (p.id === "strata") body.reasoning_effort = settings.thinking;
+  Object.assign(body, Providers.requestExtra(c, modelId, {
+    thinking: settings.thinking,
+    reasoningLimit: parseInt(store.get("reasoning_limit", 2048), 10) || 0,
+    projection: projectionLoaded() ? !!settings.esp : false,
+    mcp: (settings.mcp !== false && mcpInfo.tools > 0),
+    // Граница общего начала запроса для Strata: system-инструкция вместе с блоком <memory>
+    // идут первыми и одинаковы во всех диалогах, поэтому их помечаем как префикс (1 сообщение).
+    // Если system-сообщения нет (память выключена) — поле не отправляем.
+    prefixMessages: (body.messages.length > 1 && body.messages[0] && body.messages[0].role === "system") ? 1 : 0,
+  }));
   if (settings.temperature > 0) {
     Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
   } else {
@@ -1225,88 +1399,53 @@ async function streamAnswer(m, el) {
   }
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
-  if (p.id === "strata") {
-    if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
-    if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;
-  }
-  if (p.id !== "strata") {
-    body.stream_options = { include_usage: true };
-  }
 
-  window.__lastResponseModel = null;
-
-  let firstAt = null, thinkStart = null, usage = null, frame = 0;
+  // ---- Поток: ОДИН разбор SSE живёт в transport.js; здесь только отрисовка и метрики ----
+  let firstAt = null, thinkStart = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
 
+  const onEvent = (ev) => {
+    const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;
+    if (ev.type === "tools") { onTool(m, ev.value); return; }
+    if (ev.type === "reasoning") {
+      if (!firstAt) firstAt = performance.now();
+      if (!thinkStart) thinkStart = performance.now();
+      if (lastTool && m.reasoning && lastTool.rat === m.reasoning.length) m.reasoning += "\n\n";
+      m.reasoning += ev.value;
+    } else if (ev.type === "text") {
+      if (!firstAt) firstAt = performance.now();
+      if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
+      if (lastTool && m.text && lastTool.at === m.text.length) m.text += "\n\n";
+      m.text += ev.value;
+    }
+    if (!frame) frame = requestAnimationFrame(paint);
+  };
+
+  let res = null;
   try {
-    const url = p.buildUrl({ baseUrl: providerSettings.base_url, path: "/v1/chat/completions" });
-    const r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body),
-                                 signal: controller.signal});
-    if (!r.ok) {
-      let msg = `HTTP ${r.status}`;
-      try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-      if (r.status === 401) msg = "This server needs an API key: add it under About > Settings.";
-      throw new Error(msg);
-    }
-    const reader = r.body.getReader(), dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const {value, done} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
-      let nl;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line.startsWith("data:")) continue;
-        const data = line.slice(5).trim();
-        if (data === "[DONE]") continue;
-
-        const chunks = p.parseChunk(data);
-        if (!chunks) continue;
-        for (const c of chunks) {
-          if (c.type === "error") throw new Error(c.value);
-          if (c.type === "usage") { usage = c.value; continue; }
-          if (c.type === "model") { window.__lastResponseModel = c.value; continue; }
-          if (c.type === "tools") { onTool(m, c.value); continue; }
-
-          const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;
-          if (c.type === "reasoning") {
-            if (!firstAt) firstAt = performance.now();
-            if (!thinkStart) thinkStart = performance.now();
-            if (lastTool && m.reasoning && lastTool.rat === m.reasoning.length) m.reasoning += "\n\n";
-            m.reasoning += c.value;
-          } else if (c.type === "text") {
-            if (!firstAt) firstAt = performance.now();
-            if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
-            if (lastTool && m.text && lastTool.at === m.text.length) m.text += "\n\n";
-            m.text += c.value;
-          }
-        }
-        if (!frame) frame = requestAnimationFrame(paint);
-      }
-    }
+    res = await Transport.chat({conn: c, body, signal: controller.signal, onEvent});
   } catch (e) {
-    if (e.name === "AbortError") {
-      m.stopped = true;
-      if (p.id !== "strata" && !sessionStorage.getItem("strata.stop_toast_shown")) {
-        sessionStorage.setItem("strata.stop_toast_shown", "1");
-        toast("info", "Stopped",
-              "The backend may keep generating for a few seconds. LM Studio usually finishes the request; llama.cpp aborts.",
-              8000);
-      }
-    } else {
-      m.error = e.message || String(e);
-      toast("error", "The request failed", m.error, 6000);
+    m.error = e.message || String(e);
+    toast("error", "The request failed", m.error, 6000);
+  }
+
+  const usage = res ? res.usage : null;
+  if (res && res.aborted) {
+    m.stopped = true;
+    if (c.base !== "" && !sessionStorage.getItem("strata.stop_toast_shown")) {
+      sessionStorage.setItem("strata.stop_toast_shown", "1");
+      toast("info", "Stopped",
+            "The backend may keep generating for a few seconds. LM Studio usually finishes the request; llama.cpp aborts.",
+            8000);
     }
   }
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
 
-  // PR-2.6 step 1: structured attributes
-  m.model = window.__lastResponseModel
-    || (p.id === "strata" ? (health.model || "") : (providerSettings.model_id || ""))
-    || "";
+  // Модель ответа — только из потока. Если сервер её не сообщил, оставляем null:
+  // запрошенную модель вместо неё не подставляем.
+  m.model = (res && res.model) ? res.model : null;
+  m.modelReported = !!(res && res.model);
   m.tokens = n;
   m.tokPerSec = (n && firstAt) ? n / ((performance.now() - firstAt) / 1000) : null;
   m.stopped = !!m.stopped;
@@ -1349,7 +1488,7 @@ $("export-btn").onclick = () => {
     `<details><summary>Tool ${t.server ? `${t.server} / ` : ""}${t.tool || t.name}${t.ok ? "" : " (error)"}</summary>\n\n` +
     `\`\`\`json\n${JSON.stringify(t.arguments || {}, null, 2)}\n\`\`\`\n\n\`\`\`\n${t.result}\n\`\`\`\n\n</details>\n\n`).join("");
   const md = messages.map((m) => m.role === "user" ? `## You\n\n${m.text}\n` :
-    `## ${health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
+    `## ${m.model || "модель не сообщена"}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([md], {type: "text/markdown"}));
   a.download = `strata-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
@@ -1418,22 +1557,14 @@ function isTextFile(f) {
          TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
 }
 function visionEnabled() {
-  const p = getP();
-  if (p.id === "strata") return !!health.images;
-  // Ручной переключатель — для llama.cpp (--mmproj) и LM Studio, если caps неизвестны.
-  // Проверяем первым: пользователь явно включил — доверяем ему.
-  if (store.get("vision_manual", false)) return true;
-  // LM Studio: caps выбранной модели
-  if (p.id === "lmstudio") {
-    const caps = store.get("model_caps", null);
-    const mid = store.get("model_id", "");
-    if (Array.isArray(caps) && mid) {
-      const m = caps.find(c => c.id === mid);
-      if (m && m.capabilities && typeof m.capabilities.vision === "boolean") {
-        return m.capabilities.vision;
-      }
-    }
-  }
+  // Порядок: ручная отметка подключения → то, что сообщил сервер (каталог/проба) → неизвестно = выключено.
+  // Для неподтверждённого типа серверных данных нет, поэтому картинки выключены, пока не включишь вручную.
+  const c = conn();
+  if (!c) return false;
+  if (typeof c.flags.vision === "boolean") return c.flags.vision;
+  const k = Connections.caps(c);
+  if (typeof k.vision === "boolean") return k.vision;
+  if ((c.kind === "strata" || c.kind === "strata2") && typeof health.images === "boolean") return health.images;
   return false;
 }
 
@@ -1445,35 +1576,38 @@ function updateAttachBtnTitle() {
 }
 
 function updateVisionHint() {
-  const row = $("vision-manual-row");
-  const btn = $("prov-vision-manual");
-  const hint = $("vision-hint");
+  const c = conn();
+  // Лимит размышлений имеет смысл только у Strata 2 (OpenAI-совместимый API движка).
+  const rRow = $("conn-reasoning-row");
+  if (rRow) rRow.style.display = (c && c.kind === "strata2") ? "flex" : "none";
+
+  const row = $("conn-vision-row"), btn = $("conn-vision"), hint = $("conn-vision-hint");
   if (!row || !btn || !hint) return;
-  const p = getP();
-  if (p.id === "strata") { row.style.display = "none"; return; }
+  if (!c) { row.style.display = "none"; updateAttachBtnTitle(); return; }
   row.style.display = "flex";
-  const manual = !!store.get("vision_manual", false);
-  btn.setAttribute("aria-checked", String(manual));
-  if (p.id === "llamacpp") {
-    hint.textContent = "llama.cpp needs --mmproj to accept images";
-  } else if (p.id === "lmstudio") {
-    const caps = store.get("model_caps", null);
-    const mid = store.get("model_id", "");
-    let capValue = null;
-    if (Array.isArray(caps) && mid) {
-      const m = caps.find(c => c.id === mid);
-      if (m && m.capabilities && typeof m.capabilities.vision === "boolean") capValue = m.capabilities.vision;
-    }
-    if (capValue === true) hint.textContent = "Server reports vision: yes (auto-detected)";
-    else if (capValue === false) hint.textContent = "Server reports vision: no";
-    else hint.textContent = "Server didn't report vision; enable manually if the model supports images";
+  btn.setAttribute("aria-checked", String(visionEnabled()));
+  const k = Connections.caps(c);
+  const notes = [];
+  if (c.kind === "llamacpp") notes.push("llama.cpp принимает картинки только с флагом --mmproj");
+  if (typeof k.vision === "boolean") notes.push(k.vision ? "сервер сообщает: картинки поддерживаются" : "сервер сообщает: картинки не поддерживаются");
+  else notes.push("сервер не сообщил про картинки; включите вручную, если модель их принимает");
+  if (typeof c.flags.vision === "boolean") notes.push("ваша отметка сохранена за этим подключением");
+  if (c.kindState === "unverified" || c.kindState === "needs-redetect" || c.kindState === "mismatch") {
+    notes.push("тип подключения не подтверждён — специальные поля в запрос не идут");
   }
+  hint.textContent = notes.join("; ");
   updateAttachBtnTitle();
 }
 function addFiles(files) {
   for (const f of files) {
     if (f.type.startsWith("image/")) {
-      if (!visionEnabled()) { toast("warn", "Pictures are off", "Enable vision in About → LLM provider, or use a vision-capable model."); continue; }
+      if (!visionEnabled()) {
+        const cv = conn();
+        toast("warn", "Картинки выключены",
+          cv ? `Включите Vision в About → Подключения для «${cv.name}» или выберите модель, которая принимает картинки.`
+             : "Добавьте подключение в About → Подключения.");
+        continue;
+      }
       if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
       const r = new FileReader();
       r.onload = () => { attachments.push({kind: "image", name: f.name || "pasted image", url: r.result}); renderAttachments(); };
@@ -1568,7 +1702,10 @@ async function loadShared() {
   if (!isStrata()) { sharedOn = false; $("s-share").setAttribute("aria-checked", "false"); return; }
   try {
     const r = await fetch("settings", {headers: headers()});
-    if (r.ok) sharedOn = !!(await r.json()).shared;
+	const ct = r.headers.get("content-type") || "";
+    if (r.ok && ct.includes("application/json")) { // <--- ЗАЩИТА ОТ HTML
+        sharedOn = !!(await r.json()).shared;
+    }
   } catch (e) { /* an older server: the switch just stays off */ }
   $("s-share").setAttribute("aria-checked", String(sharedOn));
 }
@@ -1644,6 +1781,8 @@ $("scrim").onclick = () => openDrawer(false);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
 
 // ------------------------------------------------------------------ start
+Connections.init();                        // состояние подключений — до первого запроса
+Connections.subscribe(renderConnectionsCard);   // карточка «Подключения» (объявлена ниже)
 setBusy(false);
 renderChat();
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
@@ -1654,10 +1793,11 @@ loadHealth().then(loadMcp).then(() => {
 showTab(location.hash.slice(1) || "chat");
 poll();
 
-setInterval(runBackendCheck, 5000);
-runBackendCheck(); // Запуск сразу при загрузке
+// Статус проверяем у активного подключения; интервал редкий, автопереключения нет.
+updateConnectionStatus();
+setInterval(updateConnectionStatus, 10000);
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") runBackendCheck();
+  if (document.visibilityState === "visible") updateConnectionStatus();
 });
 // ==================================================================
 // MEMORY MODULE (MVP + PROFILES + PENDING)
@@ -1667,6 +1807,16 @@ let systemPromptText = "";
 let currentProfile = store.get("memory_profile", "core");
 let pendingFacts = [];
 let filteredFacts = [];
+// Факты, скрытые из списка на время редактирования ТЕКУЩЕГО профиля.
+// memory-pending.json НЕ изменяется: pending — многоразовый источник фактов.
+let hiddenFacts = new Set();
+function pendingVisible() {
+  return pendingFacts.filter(p => !hiddenFacts.has(p.fact));
+}
+function updatePendingCount() {
+  const el = $("mem-pending-count");
+  if (el) el.textContent = pendingVisible().length;
+}
 
 // === Состояние единого редактора профилей ===
 // currentProfile — активный профиль для чата. Меняется ТОЛЬКО в closeMemoryModal.
@@ -1686,50 +1836,59 @@ function createMemoryModalHTML() {
 
   const modalHTML = `
     <div id="memory-modal-scrim" class="st-scrim" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 999;"></div>
-    <div id="memory-modal" class="st-drawer" style="display: none; position: fixed; width: 900px; max-width: 95vw; left: 50%; transform: translateX(-50%); top: 5%; bottom: 5%; border-radius: 12px; overflow: hidden; flex-direction: column; z-index: 1000; background: var(--st-bg, #1e1e1e); border: 1px solid var(--st-border, #333); box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
+    <div id="memory-modal" class="st-drawer" style="display: none; position: fixed; width: 900px; max-width: 95vw; left: 50%; transform: translateX(-50%); top: 5%; bottom: 5%; border-radius: 12px; overflow: hidden; flex-direction: column; z-index: 1000; background: var(--st-bg, #1e1e1e); border: 1px solid var(--st-line, #333); box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
       
-      <div style="display: flex; justify-content: space-between; align-items: center; padding: 16px; border-bottom: 1px solid var(--st-border, #333);">
-        <div style="display: flex; gap: 10px;">
-          <button class="st-btn st-btn--secondary" id="mem-tab-dossier" type="button" style="background: var(--st-primary, #007bff); color: white;">Профили</button>
-          <button class="st-btn st-btn--secondary" id="mem-tab-system" type="button">System Prompt</button>
-          <button class="st-btn st-btn--secondary" id="mem-tab-pending" type="button">Предложения (<span id="mem-pending-count">0</span>)</button>
-        </div>
-        <button class="st-btn st-btn--icon" id="memory-modal-close" type="button" style="background: none; border: none; cursor: pointer; font-size: 1.2rem; color: var(--st-text, #fff);">✕</button>
+      <div style="display: flex; justify-content: space-between; align-items: center; padding: 16px; border-bottom: 1px solid var(--st-line, #333);">
+        <div style="display: flex; gap: 10px; flex: 1; min-width: 0;">
+          <button class="st-btn st-btn--secondary" id="mem-tab-dossier" type="button" style="flex: 1; white-space: nowrap; background: var(--st-primary, #007bff); color: white;">Профили</button>
+          <button class="st-btn st-btn--secondary" id="mem-tab-system" type="button" style="flex: 1; white-space: nowrap;">System Prompt</button>
+          <button class="st-btn st-btn--secondary" id="mem-tab-pending" type="button" style="flex: 1; white-space: nowrap;">Предложения (<span id="mem-pending-count">0</span>)</button>
+		</div>
+        <button class="st-btn st-btn--icon" id="memory-modal-close" type="button" style="background: none; border: none; cursor: pointer; font-size: 1.2rem; color: var(--st-ink, #fff);">✕</button>
       </div>
 
-      <div id="mem-view-dossier" style="flex: 1; padding: 16px; display: flex; flex-direction: column; min-height: 0;">
+      <div id="mem-view-dossier" style="flex: 1; padding: 16px; display: flex; flex-direction: column; min-height: 0; overflow-y: auto;">
 		<div style="margin-bottom: 10px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-		  <label style="color: var(--st-text, #fff);">Профиль:</label>
-		  <select id="memory-profile-select" class="st-input" style="flex: 1; min-width: 150px; padding: 8px; background: var(--st-bg, #1e1e1e); color: var(--st-text, #fff); border: 1px solid var(--st-border, #333);">
+		  <label style="color: var(--st-ink, #fff);">Профиль:</label>
+		  <select id="memory-profile-select" class="st-input" style="flex: 1; min-width: 150px; padding: 8px; background: var(--st-bg, #1e1e1e); color: var(--st-ink, #fff); border: 1px solid var(--st-line, #333);">
 			<option value="">— не выбран —</option>
 		  </select>
-		  <button class="st-btn" id="memory-edit-toggle" type="button" title="Редактировать профиль" aria-label="Edit" style="display: none; background: #dc3545; border: 1px solid #dc3545; color: #fff; padding: 4px 10px; font-size: 12px; height: 32px; border-radius: 4px; cursor: pointer;">Edit</button>
-		  <button class="st-btn st-btn--secondary" id="memory-profile-new" type="button">+ Новый</button>
-          <button class="st-btn tooltip-btn" id="mem-lamp-btn" type="button" data-tooltip="Ламповый профиль по запросу" style="height: 32px; width: 32px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; background: transparent; border: 1px solid #f5b301; color: #f5b301; border-radius: 4px;">💡</button>
-          <button class="st-btn tooltip-btn" id="memory-build-btn" type="button" data-tooltip="Сгенерировать по ключевым словам" style="height: 32px; width: 32px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; background: transparent; border: 1px solid #8b5cf6; color: #8b5cf6; border-radius: 4px;">⚡</button>
+		  <!-- Edit -->
+		  <button class="st-btn" id="memory-edit-toggle" type="button" title="Редактировать профиль" aria-label="Edit" style="display: none; background: #dc3545; border: 1px solid #dc3545; color: #fff; height: 38px; width: 100px; padding: 0; border-radius: 6px; cursor: pointer; align-items: center; justify-content: center;">Edit</button>
+		  
+		  <!-- +Новый -->
+		  <button class="st-btn st-btn--secondary" id="memory-profile-new" type="button" style="height: 38px; width: 100px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 6px;">+ Новый</button>
+		  
+		  <!-- 💡 Ламповый -->
+          <button class="st-btn tooltip-btn tooltip-btn--down" id="mem-lamp-btn" type="button" data-tooltip="Собрать ламповый профиль" style="height: 38px; width: 100px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; background: transparent; border: 1px solid #f5b301; color: #f5b301; border-radius: 6px;">💡</button>
+		  
+		  <!-- ⚡ По ключам -->
+          <button class="st-btn tooltip-btn tooltip-btn--down" id="memory-build-btn" type="button" data-tooltip="Собрать профиль по ключам" style="height: 38px; width: 100px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; background: transparent; border: 1px solid #8b5cf6; color: #8b5cf6; border-radius: 6px;">⚡</button>
 		</div>
 
 		<div style="margin-bottom: 10px; display: flex; gap: 10px; align-items: center;">
-		  <label style="color: var(--st-text, #fff); white-space: nowrap;">Имя для сохранения:</label>
-		  <input type="text" id="memory-save-name" class="st-input" placeholder="my_profile" autocomplete="off" style="flex: 1; padding: 8px; background: var(--st-bg, #1e1e1e); color: var(--st-text, #fff); border: 1px solid var(--st-border, #333);">
+		  <label style="color: var(--st-ink, #fff); white-space: nowrap;">Имя для сохранения:</label>
+		  <input type="text" id="memory-save-name" class="st-input" placeholder="my_profile" autocomplete="off" style="flex: 1; padding: 8px; background: var(--st-bg, #1e1e1e); color: var(--st-ink, #fff); border: 1px solid var(--st-line, #333);">
 		</div>
         
-        <!-- НОВАЯ ФОРМА ДЛЯ ГЕНЕРАЦИИ -->
-        <div id="mem-build-form" style="display: none; background: var(--st-surface-2, #2a2a2a); padding: 12px; border-radius: 8px; margin-bottom: 12px; border: 1px solid var(--st-border, #444); flex-direction: column; gap: 8px;">
+        <!-- ФОРМА ДЛЯ ГЕНЕРАЦИИ ПО КЛЮЧАМ -->
+        <div id="mem-build-form" style="display: none; min-height: 150px; background: var(--st-surface-2, #2a2a2a); padding: 12px; border-radius: 8px; margin-bottom: 12px; border: 1px solid #8b5cf6; flex-direction: column; justify-content: space-between; gap: 8px;">
           <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-            <input type="text" id="build-anchor" class="st-input" placeholder="Anchor: krea,wangp" style="flex: 2; min-width: 150px; padding: 6px;">
-            <input type="text" id="build-generic" class="st-input" placeholder="Generic: модели,генерация" style="flex: 2; min-width: 150px; padding: 6px;">
-            <input type="number" id="build-budget" class="st-input" value="4000" title="Бюджет символов" style="width: 80px; padding: 6px;">
+            <input type="text" id="build-anchor" class="st-input" placeholder="Anchor: krea, wangp" title="Точные уникальные названия (имена проектов, ники). Разделители: , или ;" style="flex: 2; min-width: 150px; padding: 6px;">
+            <input type="text" id="build-generic" class="st-input" placeholder="Generic: модели, генерация" title="Общие категории (модели, генерация, код). Разделители: , или ;" style="flex: 2; min-width: 150px; padding: 6px;">
+            <input type="number" id="build-budget" class="st-input" value="4000" min="500" max="12000" step="100" title="Бюджет символов (500–12000). Мягкий ориентир для LLM: если текст длиннее, билдер лишь предупреждает." style="width: 80px; padding: 6px;">
           </div>
+          <div style="font-size: 11px; color: var(--st-ink-muted, #888);">Anchor — точное уникальное название (проект, ник). Generic — общая тема. Если Anchor заполнен, факт без якоря должен содержать <b>минимум 2 разных</b> Generic-слова; без Anchor достаточно одного совпадения по Generic.</div>
+          <div style="font-size: 11px; color: var(--st-ink-muted, #888);">Ключи разделяй запятой <b>,</b> или точкой с запятой <b>;</b> («;» — для многословных фраз). Если запятых и «;» в поле нет вовсе, слова разделяются по пробелам.</div>
           <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px;">
             <button class="st-btn st-btn--secondary" id="build-cancel" type="button" style="height: 28px; font-size: 12px;">Отмена</button>
             <button class="st-btn st-btn--primary" id="build-start" type="button" style="height: 28px; font-size: 12px; background: #8b5cf6; border-color: #8b5cf6;">Сгенерировать</button>
           </div>
         </div>
         <!-- НОВАЯ ФОРМА ЛАМПОВОГО ПРОФИЛЯ -->
-		<div id="mem-lamp-form" style="display: none; background: var(--st-surface-2, #2a2a2a); padding: 12px; border-radius: 8px; margin-bottom: 12px; border: 1px solid #f5b301; flex-direction: column; gap: 8px;">
+		<div id="mem-lamp-form" style="display: none; min-height: 150px; background: var(--st-surface-2, #2a2a2a); padding: 12px; border-radius: 8px; margin-bottom: 12px; border: 1px solid #f5b301; flex-direction: column; justify-content: space-between; gap: 8px;">
 		  <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-			<input type="number" id="lamp-budget" class="st-input" value="4000" title="Бюджет символов" style="width: 90px; padding: 6px;">
+			<input type="number" id="lamp-budget" class="st-input" value="4000" min="500" max="12000" step="100" title="Бюджет символов (500–12000). Мягкий ориентир для LLM." style="width: 90px; padding: 6px;">
 		  </div>
 		  <textarea id="lamp-prompt" class="st-input" rows="3" style="padding: 6px; font-family: var(--st-font); resize: vertical; min-height: 60px;" placeholder="Например: хочу обсудить природу времени, без психоанализа. Интересует физика и философия, но не эзотерика."></textarea>
 		  <div id="lamp-route-result" style="display: none; background: var(--st-bg, #1e1e1e); padding: 8px; border-radius: 4px; font-size: 12px; line-height: 1.5;">
@@ -1741,22 +1900,23 @@ function createMemoryModalHTML() {
 		  <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px;">
 			<button class="st-btn st-btn--secondary" id="lamp-cancel" type="button" style="height: 28px; font-size: 12px;">Отмена</button>
 		    <button class="st-btn st-btn--secondary" id="lamp-route" type="button" style="height: 32px; font-size: 12px;">Анализ темы</button>
-            <button class="st-btn st-btn--primary" id="lamp-build" type="button" style="height: 32px; font-size: 12px; background: #8b5cf6; border-color: #8b5cf6; color: #fff;" disabled>Создать профиль</button>
+            <button class="st-btn st-btn--primary" id="lamp-build" type="button" style="height: 32px; font-size: 12px; background: #f5b301; border-color: #f5b301; color: #000;" disabled>Создать профиль</button>
 		  </div>
 		</div>
-        <p class="muted small" style="margin-top: 0; margin-bottom: 10px;">Факты о тебе.
+        <p class="muted small" style="margin-top: 0; margin-bottom: 10px;">Факты о тебе.</p>
         <div style="flex: 1; display: flex; flex-direction: column; min-height: 0; margin-bottom: 16px;">
-          <textarea id="memory-textarea" style="flex: 1; width: 100%; height: 100%; min-height: 300px; font-family: monospace; padding: 12px; border: 1px solid var(--st-border, #333); border-radius: 8px; background: var(--st-bg, #1e1e1e); color: var(--st-text, #fff); resize: none;"></textarea>
+          <textarea id="memory-textarea" style="flex: 1; width: 100%; height: 100%; min-height: 300px; font-family: monospace; padding: 12px; border: 1px solid var(--st-line, #333); border-radius: 8px; background: var(--st-bg, #1e1e1e); color: var(--st-ink, #fff); resize: none;"></textarea>
         </div>
         <div style="display: flex; gap: 8px; justify-content: flex-end;">
-          <button class="st-btn st-btn--secondary" id="memory-save-exit-btn" type="button">Save &amp; Exit</button>
-          <button class="st-btn st-btn--primary" id="memory-save-btn" type="button">Save</button>
+          <button class="st-btn st-btn--secondary" id="memory-save-exit-btn" type="button" style="display: none;">Save &amp; Exit</button>
+          <button class="st-btn st-btn--primary" id="memory-save-btn" type="button" style="display: none;">Save</button>
+          <button class="st-btn st-btn--secondary" id="memory-exit-btn" type="button" title="Закрыть окно; выбранный профиль станет активным в чате">Exit</button>
         </div>
       </div>
 
       <div id="mem-view-system" style="flex: 1; padding: 16px; display: none; flex-direction: column; min-height: 0;">
         <p class="muted small" style="margin-top: 0; margin-bottom: 10px;">Глобальные инструкции для модели (язык, стиль, ограничения). Работают во всех профилях и чатах.</p>
-        <textarea id="system-prompt-textarea" style="flex: 1; width: 100%; min-height: 300px; font-family: monospace; padding: 12px; border: 1px solid var(--st-border, #333); border-radius: 8px; background: var(--st-bg, #1e1e1e); color: var(--st-text, #fff); resize: none;"></textarea>
+        <textarea id="system-prompt-textarea" style="flex: 1; width: 100%; min-height: 300px; font-family: monospace; padding: 12px; border: 1px solid var(--st-line, #333); border-radius: 8px; background: var(--st-bg, #1e1e1e); color: var(--st-ink, #fff); resize: none;"></textarea>
         <div style="padding-top: 16px; text-align: right;">
           <button class="st-btn st-btn--primary" id="system-prompt-save-btn" type="button">Save System Prompt</button>
         </div>
@@ -1764,7 +1924,7 @@ function createMemoryModalHTML() {
 
       <div id="mem-view-pending" style="flex: 1; padding: 16px; display: none; flex-direction: column; min-height: 0;">
         <div style="display: flex; gap: 10px; margin-bottom: 12px;">
-          <input type="text" id="mem-search" class="st-input" placeholder="Поиск по фактам..." style="flex: 1; padding: 8px; border-radius: 4px; border: 1px solid var(--st-border, #333); background: var(--st-bg, #1e1e1e); color: var(--st-text, #fff);">
+          <input type="text" id="mem-search" class="st-input" placeholder="Поиск по фактам..." style="flex: 1; padding: 8px; border-radius: 4px; border: 1px solid var(--st-line, #333); background: var(--st-bg, #1e1e1e); color: var(--st-ink, #fff);">
           <button class="st-btn st-btn--secondary" id="mem-approve-all" type="button" style="background: #28a745; color: white; border: none;">Approve Selected</button>
           <button class="st-btn st-btn--secondary" id="mem-reject-all" type="button" style="background: #dc3545; color: white; border: none;">Reject Selected</button>
         </div>
@@ -1775,11 +1935,70 @@ function createMemoryModalHTML() {
   document.body.insertAdjacentHTML("beforeend", modalHTML);
 }
 createMemoryModalHTML();
-
+// Сброс форм генерации и кнопок тулбара в исходное состояние.
+// Вызывается при открытии/закрытии модалки, «Отмена», «+ Новый» и после/errors прогонов.
+function resetMemoryGenForms() {
+    if ($("mem-build-form")) $("mem-build-form").style.display = "none";
+    if ($("mem-lamp-form")) $("mem-lamp-form").style.display = "none";
+    const b = $("memory-build-btn");
+    if (b) { b.style.display = "inline-flex"; b.innerHTML = "⚡"; b.disabled = false; }
+    const lb = $("mem-lamp-btn");
+    if (lb) lb.style.display = "inline-flex";
+    // Внутренние кнопки 💡-формы: исходные надписи, цвет и доступность
+    const rt = $("lamp-route");
+    if (rt) { rt.textContent = "Анализ темы"; rt.disabled = false; }
+    const bl = $("lamp-build");
+    if (bl) {
+        bl.textContent = "Создать профиль";
+        bl.disabled = true;
+        bl.style.background = "#f5b301";
+        bl.style.borderColor = "#f5b301";
+        bl.style.color = "#000";
+    }
+    if ($("lamp-route-result")) $("lamp-route-result").style.display = "none";
+}
+// Централизованное переключение вкладок в модалке памяти
+function switchMemoryTab(tabName) {
+  const tabs = {
+    dossier: { view: "mem-view-dossier", btn: "mem-tab-dossier" },
+    system: { view: "mem-view-system", btn: "mem-tab-system" },
+    pending: { view: "mem-view-pending", btn: "mem-tab-pending" }
+  };
+  
+  // Сбрасываем все вкладки
+  Object.values(tabs).forEach(t => {
+    const view = $(t.view);
+    const btn = $(t.btn);
+    if (view) view.style.display = "none";
+    if (btn) btn.style.background = "transparent";
+  });
+  
+  // Активируем выбранную
+  const active = tabs[tabName];
+  if (active) {
+    const view = $(active.view);
+    const btn = $(active.btn);
+    if (view) view.style.display = "flex";
+    if (btn) btn.style.background = "var(--st-primary, #007bff)";
+  }
+  
+  // Специфичные действия при переключении
+  if (tabName === "pending") loadPending();
+  if (tabName === "system") {
+    loadSystemPrompt().then(() => {
+      const ta = $("system-prompt-textarea");
+      if (ta) ta.value = systemPromptText;
+    });
+  }
+}
 // === Helpers для единого редактора ===
 function editorIsDirty() {
     const ta = $("memory-textarea");
-    return !!ta && ta.value !== editorLastSavedText;
+    const textChanged = !!ta && ta.value !== editorLastSavedText;
+    // Имя профиля — тоже редактируемое поле: черновик (editorViewingProfile === null)
+    // со введённым именем уже отличается от исходного состояния.
+    const nameChanged = (editorSaveName || "") !== (editorViewingProfile || "");
+    return textChanged || nameChanged;
 }
 
 function updateEditorUI() {
@@ -1788,6 +2007,7 @@ function updateEditorUI() {
     const editBtn = $("memory-edit-toggle");
     const saveBtn = $("memory-save-btn");
     const saveExitBtn = $("memory-save-exit-btn");
+    const exitBtn = $("memory-exit-btn");
     const snInput = $("memory-save-name");
     if (!ta) return;
 
@@ -1798,6 +2018,7 @@ function updateEditorUI() {
         if (editBtn) editBtn.style.display = "none";
         if (saveBtn) saveBtn.disabled = true;
         if (saveExitBtn) saveExitBtn.disabled = true;
+        if (exitBtn) exitBtn.disabled = true;
         if (snInput) snInput.disabled = true;
         return;
     }
@@ -1814,8 +2035,25 @@ function updateEditorUI() {
 
     // Save разрешён только в edit-режиме и при непустом имени
     const canSave = (editorMode !== "readonly") && (editorSaveName.trim() !== "");
-    if (saveBtn) saveBtn.disabled = !canSave;
-    if (saveExitBtn) saveExitBtn.disabled = !canSave;
+    // Кнопки показываем по признаку «есть несохранённые изменения»:
+    //   нет изменений → только Exit (режим выбора профиля для работы);
+    //   есть изменения → Save и Save & Exit, Exit скрыт.
+    const dirty = editorIsDirty();
+    if (saveBtn) {
+        saveBtn.style.display = dirty ? "inline-flex" : "none";
+        saveBtn.disabled = !canSave;
+    }
+    if (saveExitBtn) {
+        saveExitBtn.style.display = dirty ? "inline-flex" : "none";
+        saveExitBtn.disabled = !canSave;
+    }
+    if (exitBtn) {
+        // Exit скрыт, только когда есть несохранённые изменения И их можно сохранить.
+        // Если Save недоступен (пустое имя или read-only режим) — Exit оставляем,
+        // иначе окно можно было бы закрыть лишь крестиком.
+        exitBtn.style.display = (dirty && canSave) ? "none" : "inline-flex";
+        exitBtn.disabled = false;
+    }
 
     // Синхронизация поля имени
     if (snInput && snInput.value !== editorSaveName) {
@@ -1865,10 +2103,11 @@ async function doSave(closeAfter) {
     }
 
     // Успех — обновляем локальное состояние
-    editorViewingProfile = target;
-    editorSaveName = target;
-    editorLastSavedText = text;
-    editorMode = "edit";   // остаёмся в edit — для сборки из фрагментов
+	editorViewingProfile = target;
+	editorSaveName = target;
+	editorLastSavedText = text;
+	editorMode = "readonly";   // сохранён — общий порядок: readonly до Edit
+	if (target === currentProfile) memoryText = text; // чат сразу видит свежую память
 
     try {
         await loadProfiles();
@@ -1878,7 +2117,7 @@ async function doSave(closeAfter) {
     }
     updateEditorUI();
     toast("success", `Сохранено [${target}]`, "");
-
+    await loadPending();   // <--- ДОБАВИТЬ ЭТУ СТРОКУ! Подтягивает свежие данные с сервера
     if (closeAfter) {
         closeMemoryModal(true);
     }
@@ -1934,7 +2173,8 @@ function updateMemoryUI() {
   const btn = $("memory-btn");
   if (btn) {
     btn.setAttribute("aria-checked", String(memoryEnabled));
-    btn.innerHTML = `${icon("brain")} Memory [${currentProfile}]: ${memoryEnabled ? "ON" : "OFF"}`;
+    btn.title = "Подключить выбранный профиль к этому чату";
+    btn.innerHTML = `${icon("brain")} Profile [${currentProfile}]: ${memoryEnabled ? "ON" : "OFF"}`;
   }
 }
 
@@ -1947,16 +2187,23 @@ async function loadPending() {
       pendingFacts = data.items || [];
       if ($("mem-pending-count")) $("mem-pending-count").textContent = pendingFacts.length;
       renderPending();
+      const ap = $("mem-approve-all");
+      if (ap) ap.title = (editorMode === "readonly")
+        ? "Вставка запрещена: профиль открыт для чтения. Включите Edit или создайте новый"
+        : "Вставить выбранные факты в редактор; из списка они скроются до смены профиля или выхода";
+      const rj = $("mem-reject-all");
+      if (rj) rj.title = "Скрыть выбранные факты из списка до смены профиля или выхода (файл не меняется)";
     }
   } catch (e) { console.error("[Memory] Failed to load pending", e); }
 }
 
 function renderPending() {
   const query = ($("mem-search")?.value || "").toLowerCase();
-  filteredFacts = pendingFacts.filter(p => 
-    p.fact.toLowerCase().includes(query) || 
+    filteredFacts = pendingVisible().filter(p =>
+    p.fact.toLowerCase().includes(query) ||
     (p.category && p.category.toLowerCase().includes(query))
-  );
+);
+updatePendingCount();
 
   const list = $("mem-pending-list");
   if (!list) return;
@@ -1969,10 +2216,10 @@ function renderPending() {
   const displayFacts = filteredFacts.slice(0, 150); // Ограничение для браузера
   
   list.innerHTML = displayFacts.map((p, i) => `
-    <div style="display: flex; gap: 10px; align-items: flex-start; padding: 8px; border-bottom: 1px solid var(--st-border, #333);">
+    <div style="display: flex; gap: 10px; align-items: flex-start; padding: 8px; border-bottom: 1px solid var(--st-line, #333);">
       <input type="checkbox" class="mem-cb" data-index="${i}" style="margin-top: 4px;">
       <div style="flex: 1;">
-        <div style="color: var(--st-text, #fff); font-size: 0.95em;">${esc(p.fact)}</div>
+        <div style="color: var(--st-ink, #fff); font-size: 0.95em;">${esc(p.fact)}</div>
         <div style="font-size: 0.8em; color: #888; margin-top: 4px;">
           <span class="badge" style="background: #444; padding: 2px 6px; border-radius: 4px;">${esc(p.category || 'unknown')}</span>
           <span style="margin-left: 8px;">Conf: ${esc(p.confidence || '?')}</span>
@@ -1989,7 +2236,7 @@ if (memBtn) {
     memoryEnabled = !memoryEnabled;
     store.set("memory_enabled", memoryEnabled);
     updateMemoryUI();
-    toast("info", "Memory " + (memoryEnabled ? "Enabled" : "Disabled"), "");
+    toast("info", "Профиль " + (memoryEnabled ? "включён" : "выключен"), "");
   };
 }
 
@@ -1997,6 +2244,7 @@ const memEditBtn = $("memory-edit-btn");
 if (memEditBtn) {
   memEditBtn.onclick = async () => {
     // Сброс редактора в пустое состояние (Вариант B: не грузим currentProfile)
+	hiddenFacts.clear();
     editorViewingProfile = null;
     editorSaveName = "";
     editorMode = "edit";
@@ -2006,17 +2254,14 @@ if (memEditBtn) {
     $("memory-save-name").value = "";
 
     // Досье — вкладка по умолчанию
-    $("mem-view-dossier").style.display = "flex";
-    $("mem-view-pending").style.display = "none";
-    if ($("mem-view-system")) $("mem-view-system").style.display = "none";
-    $("mem-tab-dossier").style.background = "var(--st-primary, #007bff)";
-    $("mem-tab-pending").style.background = "transparent";
-    if ($("mem-tab-system")) $("mem-tab-system").style.background = "transparent";
+    resetMemoryGenForms();   // формы/кнопки генерации — в исходное состояние при каждом открытии
+    switchMemoryTab("dossier");
 
     $("memory-modal").style.display = "flex";
     $("memory-modal-scrim").style.display = "block";
 
     await loadProfiles();
+	loadPending();       // <--- ДОБАВИТЬ ЭТУ СТРОКУ! Обновляет счетчик при каждом открытии
     updateEditorUI();
   };
 }
@@ -2030,7 +2275,10 @@ const closeMemoryModal = async (force = false) => {
   if (!force && editorIsDirty()) {
     if (!confirm("Есть несохранённые изменения. Выйти без сохранения?")) return;
   }
-
+  
+  hiddenFacts.clear();   // сессия редактирования закончилась — предложения возвращаются
+  renderPending();       // <--- ДОБАВИТЬ ЭТУ СТРОКУ! Обновляет счетчик и список в DOM
+  resetMemoryGenForms(); // формы генерации закрыты, кнопки тулбара — с исходными надписями
   // Скрываем модалку сразу
   if ($("memory-modal")) $("memory-modal").style.display = "none";
   if ($("memory-modal-scrim")) $("memory-modal-scrim").style.display = "none";
@@ -2067,14 +2315,8 @@ if ($("mem-tab-dossier")) {
   $("mem-tab-dossier").onclick = async (e) => {
     e.preventDefault();
     e.stopPropagation();
-
     // Только переключение вкладок, БЕЗ loadMemory (иначе затрём правки в textarea)
-    $("mem-view-dossier").style.display = "flex";
-    $("mem-view-pending").style.display = "none";
-    if ($("mem-view-system")) $("mem-view-system").style.display = "none";
-    $("mem-tab-dossier").style.background = "var(--st-primary, #007bff)";
-    $("mem-tab-pending").style.background = "transparent";
-    if ($("mem-tab-system")) $("mem-tab-system").style.background = "transparent";
+    switchMemoryTab("dossier");
   };
 }
 
@@ -2082,29 +2324,13 @@ if ($("mem-tab-system")) {
   $("mem-tab-system").onclick = async (e) => {
     e.preventDefault();
     e.stopPropagation();
-    
-        // Автосохранение убрано — новая модель: только явный Save пишет на диск
-    // Показать System Prompt
-    $("mem-view-dossier").style.display = "none";
-    $("mem-view-pending").style.display = "none";
-    $("mem-view-system").style.display = "flex";
-    $("mem-tab-dossier").style.background = "transparent";
-    $("mem-tab-pending").style.background = "transparent";
-    $("mem-tab-system").style.background = "var(--st-primary, #007bff)";
-    
-    await loadSystemPrompt();
-    $("system-prompt-textarea").value = systemPromptText;
+    switchMemoryTab("system");
   };
 }
 
 if ($("mem-tab-pending")) {
   $("mem-tab-pending").onclick = async () => {
-        // Автосохранение убрано — новая модель
-    $("mem-view-dossier").style.display = "none";
-	$("mem-view-pending").style.display = "flex";
-	if ($("mem-view-system")) $("mem-view-system").style.display = "none";
-	if ($("mem-tab-system")) $("mem-tab-system").style.background = "transparent";
-    loadPending();
+    switchMemoryTab("pending");
   };
 }
 
@@ -2137,6 +2363,20 @@ if ($("memory-save-exit-btn")) {
   };
 }
 
+// Exit — обычный выход из окна профилей (когда изменений нет).
+// Закрывает модалку и передаёт выбранный профиль кнопке профиля в чате.
+if ($("memory-exit-btn")) {
+  $("memory-exit-btn").onclick = async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (memorySaveInProgress) {
+      toast("info", "Сохранение…", "Подожди завершения записи", 3000);
+      return;
+    }
+    await closeMemoryModal(false);
+  };
+}
+
 if ($("memory-profile-select")) {
   $("memory-profile-select").addEventListener("change", async (e) => {
     if (memorySaveInProgress) {
@@ -2144,7 +2384,7 @@ if ($("memory-profile-select")) {
       toast("info", "Сохранение…", "Подожди завершения", 3000);
       return;
     }
-
+    hiddenFacts.clear();
     const newName = e.target.value;
 
     // Пустой селект = "— не выбран —"
@@ -2179,6 +2419,7 @@ if ($("memory-profile-select")) {
       const data = await r.json();
       const content = data.content || "";
       $("memory-textarea").value = content;
+      hiddenFacts.clear();
       editorViewingProfile = newName;
       editorSaveName = newName;
       editorLastSavedText = content;
@@ -2197,22 +2438,27 @@ if ($("memory-profile-new")) {
       toast("info", "Сохранение…", "Подожди завершения", 3000);
       return;
     }
+	// Закрываем формы генерации, если они открыты (одна общая функция сброса)
+    resetMemoryGenForms();
+    // Заменяем браузерный confirm на кастомную проверку
     if (editorIsDirty()) {
-      if (!confirm("Есть несохранённые изменения. Продолжить без сохранения?")) return;
+      toast("warn", "Очистка редактора", "Несохраненные изменения будут удалены", 4000);
+      // Даем 1 секунду, чтобы пользователь мог опомниться, но очищаем без confirm()
     }
-    const name = prompt("Введите название нового профиля (латиницей, без пробелов):");
-    if (!name || !/^[a-z0-9_-]+$/i.test(name)) return toast("warn", "Некорректное имя");
-
+    
+    hiddenFacts.clear();
     editorViewingProfile = null;
-    editorSaveName = name;
+    editorSaveName = "";
     editorMode = "edit";
     editorLastSavedText = "";
     $("memory-textarea").value = "";
     $("memory-profile-select").value = "";
-    $("memory-save-name").value = name;
+    $("memory-save-name").value = "";
     updateEditorUI();
-
-    toast("info", `Черновик «${name}»`, "Нажми Save, чтобы записать на диск", 6000);
+    
+    // Ставим курсор в поле имени
+    setTimeout(() => $("memory-save-name").focus(), 100);
+    toast("info", "Поля очищены", "Введите имя нового профиля для сохранения", 3000);
   };
 }
 
@@ -2221,6 +2467,11 @@ if ($("memory-save-name")) {
     editorSaveName = e.target.value.trim();
     updateEditorUI();
   });
+}
+
+// Правки текста профиля пересчитывают признак «есть изменения» → кнопки футера
+if ($("memory-textarea")) {
+  $("memory-textarea").addEventListener("input", () => updateEditorUI());
 }
 
 if ($("memory-edit-toggle")) {
@@ -2232,19 +2483,35 @@ if ($("memory-edit-toggle")) {
   };
 }
 
+// Бюджет профиля — мягкий ориентир для LLM (profile-builder1.4.py: --budget, только предупреждение
+// если вывод длиннее). Жёстких границ у билдера нет; 12000 — практически достижимый потолок вывода
+// при --max-tokens 4000, ниже 500 — профиль вырождается.
+const BUDGET_MIN = 500, BUDGET_MAX = 12000;
+function readBudget(el) {
+    const raw = (el && el.value != null) ? String(el.value).trim() : "";
+    if (!/^\d+$/.test(raw)) {
+        toast("warn", "Нужен бюджет", `Введи целое число от ${BUDGET_MIN} до ${BUDGET_MAX} символов`, 7000);
+        return null;
+    }
+    const v = parseInt(raw, 10);
+    if (v < BUDGET_MIN || v > BUDGET_MAX) {
+        toast("warn", "Бюджет вне диапазона", `Разрешено от ${BUDGET_MIN} до ${BUDGET_MAX} символов (сейчас ${raw})`, 8000);
+        return null;
+    }
+    return v;
+}
+
 // Логика формы генерации
 if ($("memory-build-btn")) {
   $("memory-build-btn").onclick = () => {
     $("mem-build-form").style.display = "flex";
-    $("memory-build-btn").style.display = "none"; // Прячем кнопку
+    $("memory-build-btn").style.display = "none"; // Прячем свою кнопку
+    $("mem-lamp-btn").style.display = "none"; // Прячем кнопку соседа!
     
-    // Подставляем текущее имя профиля, если это не core
-    $("build-name").value = currentProfile !== "core" ? currentProfile : "krea";
   };
 
   $("build-cancel").onclick = () => {
-    $("mem-build-form").style.display = "none";
-    $("memory-build-btn").style.display = "inline-flex"; // Возвращаем кнопку
+    resetMemoryGenForms(); // форма закрыта, ⚡ и 💡 снова на месте
   };
 
   $("build-start").onclick = async () => {
@@ -2256,11 +2523,12 @@ if ($("memory-build-btn")) {
     const name = "build_" + new Date().toISOString().slice(0,10).replace(/-/g,"");
     const anchor = $("build-anchor").value.trim();
     const keywords = $("build-generic").value.trim();
-    const budget = parseInt($("build-budget").value) || 4000;
 
-    if (!name || !anchor || !keywords) {
-      return toast("warn", "Заполните поля", "Имя, Anchor и Generic обязательны");
+    if (!anchor || !keywords) {
+      return toast("warn", "Заполните поля", "Anchor и Generic обязательны", 6000);
     }
+    const budget = readBudget($("build-budget"));
+    if (budget === null) return;
 
     if (editorIsDirty()) {
       if (!confirm("В редакторе есть несохранённые изменения. Продолжить генерацию? Несохранённый текст будет потерян.")) return;
@@ -2269,15 +2537,14 @@ if ($("memory-build-btn")) {
     // Прячем форму, показываем оверлей
     $("mem-build-form").style.display = "none";
     const btn = $("memory-build-btn");
-    btn.innerHTML = "⏳ Сборка...";
-    btn.disabled = true;
+    btn.disabled = true;   // кнопка сейчас скрыта — менять её надпись смысла нет
     
     const overlay = document.createElement("div");
     overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;font-family:var(--st-font);";
     overlay.innerHTML = `
       <div style="border: 4px solid rgba(255,255,255,0.2); border-top: 4px solid #8b5cf6; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-bottom: 20px;"></div>
       <div style="font-size: 18px; font-weight: 600;">Анализирую память...</div>
-      <div style="font-size: 14px; opacity: 0.7; margin-top: 8px;">Это может занять до минуты</div>
+      <div style="font-size: 14px; opacity: 0.7; margin-top: 8px;">Это может занять до 5 минут (пока отвечает LLM)</div>
       <style>@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style>
     `;
     document.body.appendChild(overlay);
@@ -2291,7 +2558,8 @@ if ($("memory-build-btn")) {
           keywords: keywords,
           anchor: anchor,
           min_generic: 2,
-          budget: budget
+          budget: budget,
+		  model: currentModelId() || health.model || "local-model" // <--- модель активного подключения
         })
       });
       
@@ -2304,23 +2572,34 @@ if ($("memory-build-btn")) {
       editorSaveName = name;
       editorMode = "edit";
       editorLastSavedText = "";   // всегда dirty: пользователь должен сохранить
-      $("memory-save-name").value = name;
       await loadProfiles();
       $("memory-profile-select").value = "";
       updateEditorUI();
 
-      
+      hiddenFacts.clear();
       toast("success", "Профиль собран", "Проверьте текст и нажмите Save", 8000);
       
     } catch (e) {
       console.error("[Build Profile] Error:", e);
-      toast("error", "Ошибка сборки", String(e.message || e), 10000);
+      const errMsg = String(e.message || e);
+      // "No facts passed" — единственная ошибка «фильтр слишком узкий».
+      // Прочие выходы билдера (backend недоступен, дегенерация и т.п.) показываем как есть.
+      if (errMsg.includes("No facts passed")) {
+         toast("warn", "Факты не найдены", "По словам Anchor/Generic ничего не найдено. Проверь слова.", 10000);
+      } else {
+         toast("error", "Ошибка сборки", errMsg, 10000);
+      }
       $("mem-build-form").style.display = "flex"; // Возвращаем форму при ошибке
     } finally {
       if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
-      btn.innerHTML = "⚡ Сгенерировать";
+      btn.innerHTML = "⚡"; // возвращаем исходную надпись (у кнопки фиксированная ширина 100px)
       btn.disabled = false;
       btn.style.display = "inline-flex"; // Возвращаем кнопку
+      // Если форма ⚡ осталась закрытой (генерация удалась) — возвращаем и кнопку 💡,
+      // иначе в тулбаре остаётся только ⚡ и путь через 💡 недоступен до перезапуска окна.
+      if ($("mem-build-form") && $("mem-build-form").style.display === "none" && $("mem-lamp-btn")) {
+        $("mem-lamp-btn").style.display = "inline-flex";
+      }
     }
   };
 	// ================= ЛАМПОВЫЙ ПРОФИЛЬ =================
@@ -2331,21 +2610,20 @@ if ($("memory-build-btn")) {
 	let lampRouted = false;
 
 	function showLampForm() {
+		resetMemoryGenForms(); // чистая форма: без старых результатов анализа и надписей прошлых прогонов
 		$("mem-lamp-form").style.display = "flex";
 		$("memory-build-btn").style.display = "none";
 		$("mem-lamp-btn").style.display = "none";
+		$("lamp-r-anchors").textContent = "—";
+		$("lamp-r-generic").textContent = "—";
+		$("lamp-r-exclude").textContent = "—";
+		$("lamp-r-note").textContent = "";
+        
 		lampRouted = false;
-		$("lamp-route-result").style.display = "none";
-		$("lamp-build").disabled = true;
-		if (!$("lamp-name").value) {
-			$("lamp-name").value = "lamp_" + new Date().toISOString().slice(0, 10).replace(/-/g, "");
-		}
 	}
 
 	function hideLampForm() {
-		$("mem-lamp-form").style.display = "none";
-		$("memory-build-btn").style.display = "inline-flex";
-		$("mem-lamp-btn").style.display = "inline-flex";
+		resetMemoryGenForms(); // форма закрыта, ⚡ и 💡 на месте, «Создать профиль» снова серая
 		lampRouted = false;
 	}
 
@@ -2353,10 +2631,8 @@ if ($("memory-build-btn")) {
 		$("mem-lamp-btn").onclick = showLampForm;
 
 		$("lamp-cancel").onclick = () => {
-			hideLampForm();
-			$("lamp-route-result").style.display = "none";
+			hideLampForm(); // закрывает форму и возвращает кнопки тулбара
 			$("lamp-prompt").value = "";
-			$("lamp-name").value = "";
 		};
 
 		$("lamp-route").onclick = async () => {
@@ -2371,7 +2647,7 @@ if ($("memory-build-btn")) {
 				const r = await fetch("/api/profile/route", {
 					method: "POST",
 					headers: headers(true),
-					body: JSON.stringify({text}),
+                    body: JSON.stringify({ text: text, model: currentModelId() || health.model || "local-model" }),
 				});
 				const data = await r.json();
 				if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
@@ -2392,7 +2668,7 @@ if ($("memory-build-btn")) {
 			} catch (e) {
 				console.error("[Lamp] Route failed:", e);
 				toast("error", "Маршрут не проложен", String(e.message || e), 8000);
-				routeBtn.textContent = "1. Проложить";
+				routeBtn.textContent = "Анализ темы"; // исходная надпись — повторный анализ возможен
 			} finally {
 				routeBtn.disabled = false;
 			}
@@ -2405,11 +2681,13 @@ if ($("memory-build-btn")) {
 			}
 			if (!lampRouted) return;
 	        const name = "lamp_" + new Date().toISOString().slice(0,10).replace(/-/g,""); // авто-имя
-			const budget = parseInt($("lamp-budget").value) || 4000;
 
 			if (!/^[a-z0-9_-]+$/i.test(name)) {
 				return toast("warn", "Плохое имя", "Латиница, цифры, дефис, подчёркивание");
 			}
+
+			const budget = readBudget($("lamp-budget"));
+			if (budget === null) return;
 
 			if (editorIsDirty()) {
 				if (!confirm("В редакторе есть несохранённые изменения. Продолжить генерацию? Несохранённый текст будет потерян.")) return;
@@ -2425,13 +2703,13 @@ if ($("memory-build-btn")) {
 			overlay.innerHTML = `
 			  <div style="border: 4px solid rgba(255,255,255,0.2); border-top: 4px solid #f5b301; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-bottom: 20px;"></div>
 			  <div style="font-size: 18px; font-weight: 600;">Собираю ламповый профиль…</div>
-			  <div style="font-size: 14px; opacity: 0.7; margin-top: 8px;">Может занять до минуты</div>
+			  <div style="font-size: 14px; opacity: 0.7; margin-top: 8px;">Может занять до 5 минут (пока отвечает LLM)</div>
 			`;
 			document.body.appendChild(overlay);
 
 			try {
 				const r = await fetch(
-					`/api/profile/build-from-current?name=${encodeURIComponent(name)}&budget=${budget}`,
+					`/api/profile/build-from-current?name=${encodeURIComponent(name)}&budget=${budget}&model=${encodeURIComponent(currentModelId() || health.model || "local-model")}`,
 					{method: "POST", headers: headers(true)}
 				);
 				const data = await r.json();
@@ -2444,19 +2722,19 @@ if ($("memory-build-btn")) {
             editorSaveName = name;
             editorMode = "edit";
             editorLastSavedText = "";   // всегда dirty
-            $("memory-save-name").value = name;
             await loadProfiles();
             $("memory-profile-select").value = "";
             updateEditorUI();
 
             hideLampForm();
+			hiddenFacts.clear();
             toast("success", `Собран «${name}»`, "Проверь текст и нажми Save", 8000);
 				} catch (e) {
 					console.error("[Lamp] Build failed:", e);
 					const msg = String(e.message || e);
 					if (msg.includes("No facts passed keyword filter")) {
 						toast("warn", "Ключи слишком узкие",
-							  "Router выдал фразы, не совпадающие с фактами. Нажми '1. Проложить' ещё раз (LLM переформулирует) или впиши имя покороче/другие ключи.",
+							  "Анализ выдал фразы, не совпадающие с фактами. Нажми «Анализ темы» ещё раз (LLM переформулирует) или впиши имя покороче/другие ключи.",
 							  12000);
 					} else {
 						toast("error", "Сборка не удалась", msg, 10000);
@@ -2464,7 +2742,11 @@ if ($("memory-build-btn")) {
 				} finally {
 				if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
 				buildBtn.disabled = false;
-				buildBtn.textContent = "2. Собрать";
+				buildBtn.textContent = "Создать профиль"; // исходная надпись
+				// Цвет: активный, если анализ остаётся в силе (повторная сборка разрешена), иначе исходный жёлтый
+				const lampActive = lampRouted;
+				buildBtn.style.background = lampActive ? "#8b5cf6" : "#f5b301";
+				buildBtn.style.borderColor = lampActive ? "#8b5cf6" : "#f5b301";
 			}
 		};
 	}
@@ -2477,193 +2759,207 @@ const getSelectedFacts = () => {
 };
 
 if ($("mem-approve-all")) {
-  $("mem-approve-all").onclick = async () => {
-    const facts = getSelectedFacts();
-    if (!facts.length) return toast("warn", "Не выбрано ни одного факта");
-    
-    console.log(`[Memory] Approving ${facts.length} facts to profile: ${currentProfile}`);
-    
-    try {
-      const r = await fetch(`api/memory/approve?profile=${currentProfile}`, {
-        method: "POST", headers: headers(true), body: JSON.stringify({facts})
-      });
-      
-      const respText = await r.text();
-      console.log(`[Memory] Approve response (${r.status}):`, respText);
-      
-      if (!r.ok) throw new Error(`Server error: ${respText}`);
-      
-      toast("success", `Одобрено ${facts.length} фактов`);
-      await loadPending(); // ЖДЕМ загрузку pending
-      await loadMemory();  // ЖДЕМ загрузку памяти (и она сама обновит textarea)
-    } catch (e) { 
-      console.error("[Memory] Approve failed:", e);
-      toast("error", "Ошибка: " + e.message); 
-    }
-  };
+$("mem-approve-all").onclick = async () => {
+const facts = getSelectedFacts();
+if (!facts.length) return toast("warn", "Не выбрано ни одного факта");
+if (editorMode === "readonly") {
+  return toast("warn", "Профиль открыт для чтения",
+    "Включите Edit или создайте новый профиль («— не выбран —»)", 8000);
+}
+const ta = $("memory-textarea");
+if (!ta) return;
+// Вставка в позицию курсора блоком строк "- факт"
+const block = facts.map(f => `- ${f}`).join("\n");
+const start = ta.selectionStart ?? ta.value.length;
+const end = ta.selectionEnd ?? ta.value.length;
+const before = ta.value.slice(0, start);
+const after = ta.value.slice(end);
+const nlBefore = (before && !before.endsWith("\n")) ? "\n" : "";
+const nlAfter = (after && !after.startsWith("\n")) ? "\n" : "";
+ta.value = before + nlBefore + block + nlAfter + after;
+const pos = (before + nlBefore + block).length;
+ta.setSelectionRange(pos, pos);
+ta.focus();
+// Скрываем из списка ТОЛЬКО на время редактирования этого профиля
+facts.forEach(f => hiddenFacts.add(f));
+renderPending();
+updateEditorUI(); // текст изменился → кнопки футера пересчитываются (Save появляется)
+toast("success", `Вставлено в редактор: ${facts.length} фактов`,
+  "Из списка они скрыты до смены профиля или выхода из окна. Файл предложений не изменён", 8000);
+};
 }
 
 if ($("mem-reject-all")) {
-  $("mem-reject-all").onclick = async () => {
-    const facts = getSelectedFacts();
-    if (!facts.length) return toast("warn", "Выберите факты для отклонения");
-    
-    try {
-      const r = await fetch("api/memory/reject", {
-        method: "POST", headers: headers(true), body: JSON.stringify({facts})
-      });
-      if (!r.ok) throw new Error("Server error");
-      toast("info", `Отклонено ${facts.length} фактов`);
-      loadPending();
-    } catch (e) { toast("error", "Ошибка: " + e.message); }
-  };
+$("mem-reject-all").onclick = async () => {
+const facts = getSelectedFacts();
+if (!facts.length) return toast("warn", "Выберите факты для отклонения");
+// Reject = скрыть из списка на время ЭТОГО профиля.
+// memory-pending.json НЕ изменяется: база только пополняется внешней утилитой.
+facts.forEach(f => hiddenFacts.add(f));
+renderPending();
+toast("info", `Скрыто из списка: ${facts.length} фактов`,
+  "Вернутся при смене профиля или закрытии окна. Файл не изменён", 8000);
+};
 }
 
 // Загружаем память при старте
 loadMemory();
 loadSystemPrompt();
 
-// ---- Provider settings UI ----
-$("prov-select").value = providerSettings.provider;
-$("prov-base").value = providerSettings.base_url || getP().defaultBaseUrl;
-$("prov-model").value = providerSettings.model_id;
-function refreshProviderUI() {
-  const p = getP();
-  $("prov-base").disabled = p.id === "strata";
-  $("prov-refresh").disabled = p.id === "strata";
-  $("prov-models-list").innerHTML = "";
-  $("prov-model-status").textContent = "";
-  updateVisionHint();
-}
-refreshProviderUI();
+// ---- Карточка «Подключения»: единственный редактор состояния подключений -----
+// Автологики нет: тип определяется только кнопкой «Определить», активное
+// подключение меняется только выбором из списка, модель — только своя для этого
+// подключения. Смена адреса обнуляет тип, каталог, модель и отметки.
+let connEditorId = null;
 
-async function maybeAutoDetectStrata() {
-  // Один раз за сессию
-  if (sessionStorage.getItem("strata.autodetect_done")) return;
-  sessionStorage.setItem("strata.autodetect_done", "1");
-
-  // Если пользователь явно выбрал провайдера за последние 30 минут — не трогаем
-  const lastChange = store.get("provider_changed_at", 0);
-  if (Date.now() - lastChange < 30 * 60 * 1000) return;
-
-  // Уже на Strata — нечего менять
-  if (store.get("provider", "strata") === "strata") return;
-
-  // Проверяем /health (это всегда LLM_BACKEND_URL = порт Strata)
-  let healthData;
-  try {
-    const r = await fetch("health", {signal: AbortSignal.timeout(3000)});
-    if (!r.ok) return;
-    healthData = await r.json();
-  } catch (e) {
-    return;                       // Strata не запущена — оставляем выбор пользователя
-  }
-  if (!healthData || typeof healthData.model !== "string" || !healthData.model) return;
-
-  // Меняем провайдера на Strata
-  const prev = {
-    provider: store.get("provider", "strata"),
-    base_url: store.get("base_url", ""),
-    model_id: store.get("model_id", ""),
-  };
-
-  store.set("provider", "strata");
-  store.set("base_url", "");
-  providerSettings.provider = "strata";
-  providerSettings.base_url = "";
-  if ($("prov-select")) $("prov-select").value = "strata";
-  if ($("prov-base")) $("prov-base").value = "";
-  refreshProviderUI();
-  loadHealth();
-  updateVisionHint();
-
-  toast("info", "Detected Strata",
-        `Switched to Strata (native) · ${healthData.model}`, 10000, {
-    label: "Undo",
-    run: () => {
-      store.set("provider", prev.provider);
-      store.set("base_url", prev.base_url);
-      store.set("model_id", prev.model_id);
-      providerSettings.provider = prev.provider;
-      providerSettings.base_url = prev.base_url;
-      if ($("prov-select")) $("prov-select").value = prev.provider;
-      if ($("prov-base")) $("prov-base").value = prev.base_url;
-      if ($("prov-model")) $("prov-model").value = prev.model_id;
-      refreshProviderUI();
-      loadHealth();
-      updateVisionHint();
-    },
-  });
+function connCurrent() {
+  let c = Connections.get(connEditorId);
+  if (!c) { c = Connections.active(); connEditorId = c ? c.id : null; }
+  return c;
 }
 
-$("prov-select").onchange = () => {
-  providerSettings.provider = $("prov-select").value;
-  store.set("provider", providerSettings.provider);
-  store.set("provider_changed_at", Date.now());
-  if (getP().id === "strata") {
-    providerSettings.base_url = "";
-  } else if (!providerSettings.base_url || /localhost/.test(providerSettings.base_url)) {
-    providerSettings.base_url = getP().defaultBaseUrl;   // ← сюда попадает 127.0.0.1
+function connOptions() {
+  return Connections.all().map((c) => {
+    const mark = c.state === "ok" ? "●" : c.state === "error" ? "✕" : "○";
+    return `<option value="${esc(c.id)}">${mark} ${esc(c.name)} · ${esc(Providers.labelOf(c.kind))}</option>`;
+  }).join("");
+}
+
+function connKindNote(c) {
+  const st = {
+    unverified: "тип не подтверждён — запрос уходит как на OpenAI, спец-полей нет",
+    detected: "тип определён по отпечатку сервера",
+    manual: "тип выбран вручную",
+    "needs-redetect": "признаков вендора мало — тип не подтверждён, нужен повторный «Определить»",
+    mismatch: "отпечатки противоречат друг другу — оставлен OpenAI-совместимый, тип укажите вручную",
+  }[c.kindState] || c.kindState;
+  const bits = [st];
+  bits.push(c.markers.length ? "признаки: " + c.markers.join(", ") : "признаков вендора нет");
+  if (c.kindPrev) bits.push("прежний тип: " + Providers.labelOf(c.kindPrev));
+  if (c.staleModel) bits.push("модель " + c.staleModel + " больше не в каталоге");
+  return bits.join(" · ");
+}
+
+function pickModel(v) {
+  const c = connCurrent(); if (!c) return;
+  const id = String(v || "").trim();
+  if (id === c.model) return;
+  Connections.setModel(c.id, id);
+  if (id) toast("info", "Модель выбрана", `${c.name} → ${id}`, 4000);
+  if (Connections.activeId() === c.id) loadHealth();   // health/vision относятся к выбранной модели
+}
+
+function renderConnectionsCard() {
+  const sel = $("conn-select");
+  if (!sel) return;
+  const c = connCurrent();
+  sel.innerHTML = connOptions();
+  if (c) sel.value = c.id;
+  const focused = document.activeElement ? document.activeElement.id : "";
+  const setInput = (id, v) => { const el = $(id); if (el && el.id !== focused) el.value = v; };
+
+  setInput("conn-name", (c && c.name) || "");
+  setInput("conn-base", c ? c.base : "");
+  setInput("conn-model", c ? Connections.selectedModel(c) : "");
+  setInput("conn-reasoning-limit", store.get("reasoning_limit", 2048));
+
+  const kindSel = $("conn-kind");
+  const kinds = Providers.MANUAL_KINDS.filter((k) => (k !== "strata" || Connections.isNative(c)));
+  kindSel.innerHTML = kinds.map((k) => `<option value="${k}">${esc(Providers.labelOf(k))}</option>`).join("");
+  kindSel.value = (c && c.kind) || "openai";
+  $("conn-kind-state").textContent = c ? c.kindState : "";
+  $("conn-kind-note").textContent = c ? connKindNote(c) : "";
+
+  const st = (c && c.state) || "unknown";
+  $("conn-state").textContent = st === "ok" ? "доступно"
+    : st === "error" ? "нет связи" + (c && c.lastError ? ": " + c.lastError : "")
+    : "не проверялось";
+  $("conn-model-status").textContent = c
+    ? (c.catalog.length ? `${c.catalog.length} модел.` + (c.catalogAt ? " · " + new Date(c.catalogAt).toLocaleTimeString() : "") : "каталог пуст")
+    : "";
+  $("conn-remove").disabled = Connections.all().length <= 1;
+
+  const list = $("conn-models-list");
+  list.innerHTML = (c && c.catalog.length)
+    ? c.catalog.map((m) => `<button type="button" class="chip" data-pick-model="${esc(m.id)}">${esc(m.name || m.id)}` +
+        `${m.loaded === false ? " · не загружена" : ""}${m.ctx && m.ctx.max ? " · ctx " + m.ctx.max : ""}</button>`).join(" ")
+    : `<span class="muted">модели появятся после «Каталог» или «Определить»</span>`;
+  list.querySelectorAll("[data-pick-model]").forEach((b) => { b.onclick = () => pickModel(b.dataset.pickModel); });
+
+  updateVisionHint();
+}
+
+$("conn-select").onchange = (e) => {
+  connEditorId = e.target.value;
+  const switched = Connections.setActive(e.target.value);  // только явное действие, автопереключения нет
+  if (switched) { loadHealth(); updateConnectionStatus(); }  // пилюля, read-only и health — сразу нового подключения
+};
+$("conn-name").onchange = () => { const c = connCurrent(); if (c) Connections.rename(c.id, $("conn-name").value); };
+$("conn-apply").onclick = () => {
+  const c = connCurrent(); if (!c) return;
+  const prev = c.base;
+  if (!Connections.setBase(c.id, $("conn-base").value)) { renderConnectionsCard(); return; }
+  toast("info", "Адрес изменён", "Тип, каталог, модель и отметки этого подключения сброшены: нажмите «Определить».", 9000,
+        {label: "Вернуть", run: () => { Connections.setBase(c.id, prev); }});
+};
+$("conn-kind").onchange = () => { const c = connCurrent(); if (c) Connections.setKind(c.id, $("conn-kind").value); };
+
+async function detectConnection() {
+  const c = connCurrent(); if (!c) return;
+  $("conn-kind-note").textContent = "проверяю отпечатки сервера…";
+  const r = await Connections.refresh(c.id);
+  if (!r.ok) {
+    toast("error", "Каталог недоступен", `${c.name}: отпечатки и список моделей получить не удалось`, 6000);
+  } else if (r.kindState === "mismatch") {
+    toast("warn", "Отпечатки противоречат друг другу", "Тип не определён: выберите его вручную в списке «Тип».", 9000);
+  } else if (r.kindState === "needs-redetect") {
+    toast("warn", "Признаков мало", "Тип оставлен OpenAI-совместимым; спец-поля в запрос не идут.", 8000);
+  } else {
+    toast("success", "Тип определён", `${c.name}: ${Providers.labelOf(r.kind)} · ${r.models.length} модел.`, 6000);
   }
-  store.set("base_url", providerSettings.base_url);
-  $("prov-base").value = providerSettings.base_url;
-  refreshProviderUI();
-  loadHealth();
+  if (c.id === Connections.activeId()) loadHealth();
+}
+$("conn-detect").onclick = detectConnection;
+$("conn-refresh").onclick = detectConnection;
+
+$("conn-model").onchange = () => pickModel($("conn-model").value);
+$("conn-vision").onclick = () => {
+  const c = connCurrent(); if (!c) return;
+  const next = !visionEnabled();
+  Connections.setFlag(c.id, "vision", next);
+  toast("info", "Отметка о картинках", `${c.name}: ${next ? "картинки отправляются" : "картинки не отправляются"}`, 5000);
+};
+$("conn-reasoning-limit").onchange = () => {
+  const v = parseInt($("conn-reasoning-limit").value, 10);
+  store.set("reasoning_limit", (isFinite(v) && v > 0) ? v : 0);
+};
+$("conn-add").onclick = () => {
+  const c = Connections.add({ name: "Подключение " + (Connections.all().length + 1), base: "" });
+  connEditorId = c.id;
+  Connections.setActive(c.id);
+  toast("info", "Подключение добавлено", "Укажите адрес (пусто = этот сервер), затем «Определить».", 7000);
+};
+$("conn-test").onclick = async () => {
+  const c = connCurrent(); if (!c) return;
+  $("conn-state").textContent = "проверяю…";
+  const r = await Connections.ping(c.id);
+  if (r.ok) toast("success", "Сервер отвечает", `${c.name}: HTTP ${r.status}`, 5000);
+  else toast("error", "Сервер не отвечает", `${c.name}: ${r.error}`, 7000);
+};
+$("conn-remove").onclick = () => {
+  const c = connCurrent(); if (!c) return;
+  if (Connections.all().length <= 1) { toast("warn", "Нельзя удалить", "Подключение должно остаться хотя бы одно."); return; }
+  if (!Connections.remove(c.id)) { toast("warn", "Не удалилось", "Подключение должно остаться хотя бы одно."); return; }
+  connEditorId = null;
+  toast("info", "Подключение удалено", `Чаты и вложения не тронуты: ${c.name}`, 5000);
 };
 
-$("prov-base").onchange = () => {
-  providerSettings.base_url = $("prov-base").value.trim();
-  store.set("base_url", providerSettings.base_url);
-};
-$("prov-model").onchange = () => {
-  const v = $("prov-model").value.trim();
-  if (v === providerSettings.model_id) return;
-  providerSettings.model_id = v;
-  store.set("model_id", v);
-  updateVisionHint();  
-  if (v) toast("info", "Model selected", v, 3000);
-};
-$("prov-refresh").onclick = async () => {
-  $("prov-vision-manual").onclick = () => {
-  const cur = $("prov-vision-manual").getAttribute("aria-checked") === "true";
-  store.set("vision_manual", !cur);
-  $("prov-vision-manual").setAttribute("aria-checked", String(!cur));
-  updateVisionHint();
-  };
-  const p = getP();
-  if (p.id === "strata") return;
-  $("prov-model-status").textContent = "loading…";
-  const base = providerSettings.base_url || p.defaultBaseUrl;
-  const r = await p.fetchCapabilities({ baseUrl: base });
-  if (r.error) { $("prov-model-status").textContent = r.error; return; }
-  if (!r.models.length) {
-    $("prov-model-status").textContent = "no models reported; enter id manually";
-    return;
-  }
-  providerSettings._caps = r.models;
-  store.set("model_caps", r.models);
-  updateVisionHint();  
-  $("prov-model-status").textContent = `${r.models.length} model(s)`;
-  $("prov-models-list").innerHTML = r.models
-    .map((m) => `<button type="button" class="chip" data-pick-model="${esc(m.id)}">${esc(m.name)}</button>`)
-    .join(" ");
-  $("prov-models-list").querySelectorAll("[data-pick-model]").forEach((b) => {
-    b.onclick = () => {
-      $("prov-model").value = b.dataset.pickModel;
-      providerSettings.model_id = b.dataset.pickModel;
-      store.set("model_id", providerSettings.model_id);
-      updateVisionHint();
-      toast("info", "Model selected", b.dataset.pickModel, 4000);
-    };
-  });
-};
+// Лимит размышлений — настройка запроса, а не подключения: храним отдельным ключом.
+const connReasoningLimit = store.get("reasoning_limit", 2048);
+if (connReasoningLimit && !$("conn-reasoning-limit").value) $("conn-reasoning-limit").value = connReasoningLimit;
 
-$("prov-vision-manual").onclick = () => {
-  const cur = $("prov-vision-manual").getAttribute("aria-checked") === "true";
-  store.set("vision_manual", !cur);
-  $("prov-vision-manual").setAttribute("aria-checked", String(!cur));
-  updateVisionHint();
-};
+renderConnectionsCard();
+
 document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
         if ($("mem-lamp-form") && $("mem-lamp-form").style.display !== "none") {

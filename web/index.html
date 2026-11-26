@@ -242,6 +242,17 @@
     opacity: 1;
     transform: translateX(-50%) translateY(-6px);
   }
+  /* Подсказка вниз, под кнопку. Нужно для кнопок внутри прокручиваемой панели
+     («Профили», overflow-y: auto): направленный вверх тултип обрезается по
+     верхнему краю панели и уходит под панель вкладок. */
+  .tooltip-btn--down::after {
+    bottom: auto;
+    top: 100%;
+    transform: translateX(-50%) translateY(-4px);
+  }
+  .tooltip-btn--down:hover::after {
+    transform: translateX(-50%) translateY(6px);
+  }
 </style>
 
 <script>
@@ -322,13 +333,13 @@
           <input type="file" id="import-input" multiple accept=".json,.jsonl,.md" style="display:none;">
 		  <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
-          <!-- Кнопка включения памяти -->
-			<button class="st-btn st-btn--secondary" id="memory-btn" type="button">
+          <!-- Кнопка включения профиля -->
+			<button class="st-btn st-btn--secondary" id="memory-btn" type="button" title="Подключить выбранный профиль к этому чату">
 			  <!-- Иконка и текст добавятся через JS -->
-			  Memory: OFF
+			  Profile: OFF
 			</button>
 			<!-- Кнопка редактирования -->
-			<button class="st-btn st-btn--icon" id="memory-edit-btn" type="button" title="Edit Memory (memory.md)">
+			<button class="st-btn st-btn--icon" id="memory-edit-btn" type="button" title="Редактировать/Выбрать профиль">
 			  <!-- Можно использовать иконку карандаша или шестеренки, если есть в sprite.svg, например -->
 			  <svg class="st-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
 			</button>
@@ -437,33 +448,54 @@
         <p class="muted">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
         <dl class="facts" id="facts-api"></dl>
       </div>
-	  <div class="st-card" id="provider-card">
-		  <span class="card-title">LLM provider</span>
+	  <div class="st-card" id="connections-card">
+		  <span class="card-title">Подключения</span>
 		  <div class="st-field">
-			<label class="st-label" for="prov-select">Provider</label>
-			<select class="st-input" id="prov-select">
-			  <option value="strata">Strata (native)</option>
-			  <option value="lmstudio">LM Studio</option>
-			  <option value="llamacpp">llama.cpp</option>
-			</select>
+			<label class="st-label" for="conn-select">Активное подключение <output id="conn-state"></output></label>
+			<select class="st-input" id="conn-select"></select>
 		  </div>
 		  <div class="st-field">
-			<label class="st-label" for="prov-base">Base URL <output>внешний движок; для Strata — не используется</output></label>
-			<input class="st-input" id="prov-base" type="url" placeholder="http://localhost:1234">
+			<label class="st-label" for="conn-name">Название</label>
+			<input class="st-input" id="conn-name" type="text" placeholder="Например, llama.cpp на 8081">
 		  </div>
 		  <div class="st-field">
-			<label class="st-label" for="prov-model">Model <output id="prov-model-status"></output></label>
+			<label class="st-label" for="conn-base">Base URL <output>пусто = этот сервер; адрес и порт указываются вручную</output></label>
 			<div style="display:flex;gap:8px;">
-			  <input class="st-input" id="prov-model" type="text" placeholder="model id" style="flex:1;">
-			  <button class="st-btn st-btn--secondary" id="prov-refresh" type="button">Refresh</button>
+			  <input class="st-input" id="conn-base" type="text" placeholder="http://127.0.0.1:8081" style="flex:1;">
+			  <button class="st-btn st-btn--secondary" id="conn-apply" type="button">Применить</button>
 			</div>
-			<div id="prov-models-list" class="muted small" style="margin-top:4px;"></div>
 		  </div>
-		  <div class="toggle-row" id="vision-manual-row" style="display:none;">
-            <span>Vision (manual)<br><span class="muted small" id="vision-hint"></span></span>
-            <button class="st-toggle" id="prov-vision-manual" role="switch" aria-checked="false" aria-label="Enable vision manually"></button>
+		  <div class="st-field">
+			<label class="st-label" for="conn-kind">Тип <output id="conn-kind-state"></output></label>
+			<div style="display:flex;gap:8px;">
+			  <select class="st-input" id="conn-kind" style="flex:1;"></select>
+			  <button class="st-btn st-btn--secondary" id="conn-detect" type="button">Определить</button>
+			</div>
+			<div id="conn-kind-note" class="muted small" style="margin-top:4px;"></div>
+		  </div>
+		  <div class="st-field">
+			<label class="st-label" for="conn-model">Модель <output id="conn-model-status"></output></label>
+			<div style="display:flex;gap:8px;">
+			  <input class="st-input" id="conn-model" type="text" placeholder="model id" style="flex:1;">
+			  <button class="st-btn st-btn--secondary" id="conn-refresh" type="button">Каталог</button>
+			</div>
+			<div id="conn-models-list" class="muted small" style="margin-top:4px;"></div>
+		  </div>
+		  <div class="toggle-row" id="conn-vision-row" style="display:none;">
+            <span>Vision (вручную)<br><span class="muted small" id="conn-vision-hint"></span></span>
+            <button class="st-toggle" id="conn-vision" role="switch" aria-checked="false" aria-label="Vision вручную"></button>
           </div>
-		  <p class="muted small">Strata — нативный движок этого сервера. Внешние провайдеры проксируются через /api/proxy.</p>
+          <div id="conn-reasoning-row" style="display: none; align-items: center; gap: 8px; margin-top: 10px;">
+            <label style="font-size: 14px; color: var(--st-text);">Reasoning Limit (tokens):</label>
+            <input type="number" id="conn-reasoning-limit" class="st-input" value="2048" style="width: 100px; padding: 4px;">
+          </div>
+          <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+            <button class="st-btn st-btn--secondary" id="conn-add" type="button">Добавить</button>
+            <button class="st-btn st-btn--secondary" id="conn-test" type="button">Проверить доступность</button>
+            <button class="st-btn st-btn--secondary" id="conn-remove" type="button">Удалить</button>
+          </div>
+		  <p class="muted small">Подключения, каталоги моделей и настройки хранятся в этом браузере.
+		    Внешние серверы проксируются через /api/proxy. Ни один сервер не перезагружается и не меняет модель сам.</p>
       </div>
       <div class="st-card">
         <span class="card-title">Settings</span>
@@ -566,8 +598,9 @@
 <div class="scrim" id="scrim" hidden></div>
 <div class="st-toasts" id="toasts" aria-live="polite"></div>
 
+<script src="web/transport.js"></script>
 <script src="web/providers.js"></script>
-<script src="web/backend-detector.js"></script>
+<script src="web/connections.js"></script>
 <script src="web/app.js"></script>
 <script src="web/history-module.js"></script>
 

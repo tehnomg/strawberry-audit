@@ -33,7 +33,9 @@ if (typeof window.saveChat === 'function') {
         const result = originalSaveChat.apply(this, arguments);
         // Пропускаем синхронизацию если явно запрещено (оптимизация New Chat)
         if (!window.__strata_history_skip_sync) {
-            try { syncCurrentHistory(); } catch (e) { console.error("History sync failed", e); }
+            try {
+                Promise.resolve(syncCurrentHistory()).catch((e) => console.error("History sync failed", e));
+            } catch (e) { console.error("History sync failed", e); }
         }
         return result;
     };
@@ -52,8 +54,10 @@ if (newBtn && typeof newBtn.onclick === "function") {
             return originalNewChatHandler.call(this, e);
         }
 
-        // Сохраняем старый чат до очистки messages
-        syncCurrentHistory();
+        // Сохраняем старый чат до очистки messages: снимок сообщений берётся
+        // синхронно, а POST уходит в фоне (ждать здесь нельзя — кнопкаNew Chat
+        // должна отрабатывать сразу).
+        Promise.resolve(syncCurrentHistory()).catch((e) => console.error("[New Chat] save failed", e));
 
         window.__strata_history_skip_sync = true;
 
@@ -97,11 +101,16 @@ let historyLoadState = "unknown";   // "unknown" | "ok" | "error"
 const historyFilters = {
     pinnedOnly: !!store.get("historyPinnedOnly", false),
 	aiMode: !!store.get("historyAiMode", false), // <--- НОВОЕ
+    sortMode: store.get("historySortMode", "discussion") === "import" ? "import" : "discussion", // Stage 16.2
     pageSize: 120,
     loadedPage: 0,
     hasMore: false,
     total: 0,
 };
+// Stage 16.3: «Load more» только догружает порцию. Позиция прокрутки
+// пользователя сохраняется, автоматического перехода к текущему чату при
+// догрузке нет — к текущему чату по-прежнему ведёт только кнопка Current.
+let historyPreserveScroll = false;
 let searchSeq = 0;
 let searchAbort = null;
 let searchTimer = null;
@@ -114,14 +123,75 @@ async function fetchWithRetry(url, options, retries = 3) {
     for (let i = 0; i <= retries; i++) {
         try {
             const r = await fetch(url, options);
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            if (!r.ok) {
+                // Сервер может отказать осмысленно (например, отменить сохранение
+                // из-за несопоставимых метаданных вложений). Его detail важнее,
+                // чем «HTTP 500», поэтому прокидываем его наверх.
+                let detail = "";
+                try {
+                    const j = await r.json();
+                    if (j && j.detail) detail = String(j.detail);
+                } catch (_) { /* тело не JSON — оставляем пустым */ }
+                const err = new Error(`HTTP ${r.status}${detail ? ": " + detail : ""}`);
+                err.status = r.status;
+                err.detail = detail;
+                // 4xx — отказ по содержимому запроса, повтор тот же payload не лечит.
+                if (r.status >= 400 && r.status < 500) throw Object.assign(err, { noRetry: true });
+                throw err;
+            }
             return r;
         } catch (e) {
             lastErr = e;
-            if (i < retries) await new Promise(res => setTimeout(res, delays[i]));
+            if (i < retries && !e.noRetry) await new Promise(res => setTimeout(res, delays[i]));
+            if (e.noRetry) throw e;
         }
     }
     throw lastErr;
+}
+
+
+// ===== Stage 16.1: единый ключ порядка истории (вариант A) =================
+// updated_at -> created_at -> imported_at; равные значения -> tie-breaker по id.
+// mtime файла сервера в порядке не участвует. Правило «импорт младше 24 ч»
+// осталось только для бейджа NEW (isNewImport), на порядок оно больше не влияет.
+function toTimeValue(v) {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string" && v) {
+        const t = Date.parse(v);
+        if (Number.isFinite(t)) return t;
+    }
+    return null;
+}
+
+function chatDiscussionTime(chat) {
+    if (!chat) return 0;
+    const cands = [chat.source_updated_at, chat.created, chat.imported_at];
+    for (const v of cands) {
+        const t = toTimeValue(v);
+        if (t !== null) return t;
+    }
+    return 0;
+}
+
+function chatSortTime(chat, mode) {
+    if (!chat) return 0;
+    if (mode === "discussion") return chatDiscussionTime(chat);
+    const cands = [chat.updated, chat.created, chat.imported_at];
+    for (const v of cands) {
+        const t = toTimeValue(v);
+        if (t !== null) return t;
+    }
+    return 0;
+}
+
+function compareHistory(a, b) {
+    const pa = !!a.pinned, pb = !!b.pinned;
+    if (pa !== pb) return pa ? -1 : 1;
+    const d = chatSortTime(b, historyFilters.sortMode) - chatSortTime(a, historyFilters.sortMode);
+    if (d) return d;
+    const ai = String(a.id || ""), bi = String(b.id || "");
+    if (ai === bi) return 0;
+    return ai < bi ? -1 : 1;
 }
 
 async function saveChatToServer(chat) {
@@ -129,8 +199,8 @@ async function saveChatToServer(chat) {
         id: chat.id,
         title: chat.title,
 		pinned: !!chat.pinned,
-        created_at: new Date(chat.created).toISOString(),
-        updated_at: new Date(chat.updated).toISOString(),
+        created_at: new Date(chat.created || chatSortTime(chat, "import") || Date.now()).toISOString(),
+        updated_at: new Date(chat.updated || chatSortTime(chat, "import") || Date.now()).toISOString(),
         model: chat.model || "unknown",
         source: chat.source || "native",
         original_id: chat.original_id ?? null,
@@ -150,7 +220,7 @@ async function saveChatToServer(chat) {
         });
     } catch (e) {
         console.error("[History] Save failed:", e);
-        toast("error", "Not saved", "History server did not save the chat", 6000);
+        toast("error", "Not saved", (e && e.detail) ? e.detail : "History server did not save the chat", 6000);
     }
 }
 
@@ -174,15 +244,15 @@ async function loadHistoryFromServer(page = 0, append = false) {
     if (historyFilters.pinnedOnly) params.set("pinned_only", "true");
     params.set("page", String(page));
     params.set("page_size", String(historyFilters.pageSize));
+    params.set("sort_mode", historyFilters.sortMode);
     try {
         const r = await fetch(`${SERVER}?${params.toString()}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
         const mapped = (data.chats || []).map(c => ({
             id: c.id, number: c.number, title: c.title, model: c.model,
-            created: c.created_at ? new Date(c.created_at).getTime()
-                     : (c.updated_at ? new Date(c.updated_at).getTime() : Date.now()),
-            updated: c.updated_at ? new Date(c.updated_at).getTime() : Date.now(),
+            created: toTimeValue(c.created_at) ?? toTimeValue(c.updated_at),
+            updated: toTimeValue(c.updated_at),
             message_count: c.message_count || 0,
             source: c.source ?? null,
             original_id: c.original_id ?? null,
@@ -203,6 +273,8 @@ async function loadHistoryFromServer(page = 0, append = false) {
         } else {
             localHistory = mapped;
         }
+        // порядок задаёт один компаратор, а не порядок страниц ответа сервера
+        sortHistory();
         historyFilters.loadedPage = page;
         historyFilters.hasMore = !!data.has_more;
         historyFilters.total = data.total || 0;
@@ -219,8 +291,10 @@ async function loadHistoryFromServer(page = 0, append = false) {
                         id: currentHistoryId,
                         title: full.title || currentHistoryId,
                         model: full.model || "unknown",
-                        created: full.created_at ? new Date(full.created_at).getTime() : Date.now(),
-                        updated: full.updated_at ? new Date(full.updated_at).getTime() : Date.now(),
+                        created: toTimeValue(full.created_at) ?? toTimeValue(full.updated_at),
+                        updated: toTimeValue(full.updated_at),
+                        source_updated_at: full.source_updated_at ?? null,
+                        imported_at: full.imported_at ?? null,
                         message_count: full.messages ? full.messages.length : 0,
                         source: full.source || "native",
                         pinned: !!full.pinned,
@@ -257,10 +331,7 @@ function refreshHistoryIfOpen() {
 
 
 function sortHistory() {
-    localHistory.sort((a, b) => {
-        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-        return (b.updated || 0) - (a.updated || 0);
-    });
+    localHistory.sort(compareHistory);
 }
 
 function restoreHistoryFilters() {
@@ -310,6 +381,145 @@ function restoreHistoryFilters() {
         };
         toolbar.appendChild(aiBtn);
     }
+
+    if (!document.getElementById("history-sort-toggle")) {
+        const sortBtn = document.createElement("button");
+        sortBtn.id = "history-sort-toggle";
+        sortBtn.type = "button";
+        sortBtn.className = "st-btn st-btn--secondary";
+        sortBtn.style.cssText = "flex-shrink:0;height:32px;padding:0 10px;font-size:12px;";
+        const sortLabel = () => (historyFilters.sortMode === "discussion" ? "По обсуждению" : "По импорту");
+        sortBtn.textContent = sortLabel();
+        sortBtn.title = "Режим сортировки: по дате обсуждения или по дате импорта в Strawberry";
+        sortBtn.setAttribute("aria-pressed", String(historyFilters.sortMode === "discussion"));
+        if (historyFilters.sortMode === "discussion") sortBtn.style.background = "var(--st-accent, #007bff)";
+        sortBtn.onclick = () => {
+            historyFilters.sortMode = historyFilters.sortMode === "discussion" ? "import" : "discussion";
+            store.set("historySortMode", historyFilters.sortMode);
+            sortBtn.textContent = sortLabel();
+            sortBtn.setAttribute("aria-pressed", String(historyFilters.sortMode === "discussion"));
+            sortBtn.style.background = historyFilters.sortMode === "discussion" ? "var(--st-accent, #007bff)" : "";
+            localHistory = [];
+            historyFilters.loadedPage = 0;
+            lastSearchResults = null;
+            runSearchNow();
+        };
+        toolbar.appendChild(sortBtn);
+    }
+}
+
+// ===== Saved filters (сервер: GET/POST/DELETE /api/filters) =========
+// Файл saved_filters.json создаёт сервер; UI только читает/добавляет/удаляет.
+const FILTERS_API = "/api/filters";
+let savedFilters = [];
+
+async function loadSavedFilters() {
+    try {
+        const r = await fetch(FILTERS_API);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        savedFilters = Array.isArray(data.filters) ? data.filters : [];
+    } catch (e) {
+        console.error("[History] Saved filters load failed:", e);
+        savedFilters = [];
+    }
+    renderSavedFilters();
+    return savedFilters;
+}
+
+function savedFiltersHost() {
+    const toolbar = document.querySelector(".st-history-toolbar");
+    if (!toolbar) return null;
+    let host = document.getElementById("history-saved-filters");
+    if (!host) {
+        host = document.createElement("div");
+        host.id = "history-saved-filters";
+        host.setAttribute("aria-label", "Saved filters");
+        host.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:0 2px 8px;";
+        toolbar.insertAdjacentElement("afterend", host);
+    }
+    return host;
+}
+
+function renderSavedFilters() {
+    const host = savedFiltersHost();
+    if (!host) return;
+    const cur = ((document.getElementById("history-search") || {}).value || "").trim();
+    host.innerHTML = "";
+
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "st-btn st-btn--secondary";
+    saveBtn.style.cssText = "height:26px;padding:0 10px;font-size:12px;border-radius:999px;flex-shrink:0;";
+    saveBtn.textContent = "+ save filter";
+    saveBtn.title = "Сохранить текущий поисковый запрос как постоянный фильтр";
+    saveBtn.onclick = saveCurrentFilter;
+    host.appendChild(saveBtn);
+
+    savedFilters.forEach((f) => {
+        const wrap = document.createElement("span");
+        wrap.style.cssText = "display:inline-flex;align-items:center;height:26px;border:1px solid var(--st-line, #ccc);border-radius:999px;background:var(--st-surface-2, transparent);";
+        if (cur && (f.query || "") === cur) {
+            wrap.style.background = "var(--st-accent-tint, rgba(16,185,129,.12))";
+            wrap.style.borderColor = "var(--st-accent, #10b981)";
+        }
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.textContent = String(f.name || f.query || "").slice(0, 24);
+        chip.title = [f.query, (Array.isArray(f.tags) && f.tags.length) ? "tags: " + f.tags.join(", ") : ""]
+            .filter(Boolean).join(" | ");
+        chip.style.cssText = "height:24px;padding:0 8px;border:0;background:transparent;color:var(--st-ink-soft, inherit);font:inherit;font-size:12px;cursor:pointer;";
+        chip.onclick = () => applySavedFilter(f);
+        const del = document.createElement("button");
+        del.type = "button";
+        del.textContent = "×";
+        del.title = "Удалить фильтр";
+        del.style.cssText = "width:20px;height:24px;border:0;background:transparent;color:var(--st-ink-muted, #888);font-size:14px;line-height:1;cursor:pointer;";
+        del.onclick = (e) => { e.stopPropagation(); deleteSavedFilter(f); };
+        wrap.appendChild(chip);
+        wrap.appendChild(del);
+        host.appendChild(wrap);
+    });
+}
+
+function applySavedFilter(f) {
+    const input = document.getElementById("history-search");
+    if (!input || !f) return;
+    let q = String(f.query || "").trim();
+    if (!q && Array.isArray(f.tags) && f.tags.length) q = String(f.tags[0]);
+    input.value = q;
+    if (searchTimer) { clearTimeout(searchTimer); searchTimer = null; }
+    runSearchNow();
+}
+
+async function saveCurrentFilter() {
+    const q = ((document.getElementById("history-search") || {}).value || "").trim();
+    if (!q) { toast("warn", "Нечего сохранять", "Введите поисковый запрос, затем нажмите «+ save filter»", 5000); return; }
+    try {
+        const r = await fetch(FILTERS_API, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: q.slice(0, 24), query: q, tags: [] })
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        await loadSavedFilters();
+        toast("success", "Фильтр сохранён", q, 4000);
+    } catch (e) {
+        console.error("[History] Save filter failed:", e);
+        toast("error", "Фильтр не сохранён", String(e.message || e), 6000);
+    }
+}
+
+async function deleteSavedFilter(f) {
+    if (!f || !f.id) return;
+    try {
+        const r = await fetch(`${FILTERS_API}/${encodeURIComponent(f.id)}`, { method: "DELETE" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        await loadSavedFilters();
+    } catch (e) {
+        console.error("[History] Delete filter failed:", e);
+        toast("error", "Фильтр не удалён", String(e.message || e), 6000);
+    }
 }
 
 function setCurrentHistoryId(id) {
@@ -345,11 +555,11 @@ function getChatById(id) {
 }
 
 // ✅ FIX от Swift: try-catch для защиты от переполнения localStorage
-function addNewChat(chat) {
+async function addNewChat(chat) {
     chat.message_count = (chat.messages || []).length;
     localHistory.unshift(chat);
 	sortHistory();
-    saveChatToServer(chat);
+    await saveChatToServer(chat);
     refreshHistoryIfOpen();
 }
 
@@ -378,7 +588,7 @@ async function saveHistoryChat(chat) {
     if (index === -1) return false;
     localHistory[index] = chat;
 	sortHistory();
-    saveChatToServer(chat);
+    await saveChatToServer(chat);
     refreshHistoryIfOpen();
     return true;
 }
@@ -436,7 +646,17 @@ function nextHistoryNumber() {
 
 
 
-function saveCurrentToHistory() {
+// Модель, которую сообщил сервер в последнем полученном ответе (assistant.model).
+// Это единственный источник для chat.model: ни health, ни метрики, ни запрошенная
+// модель сюда не подставляются.
+function lastReportedModel() {
+    for (const m of [...(window.messages || [])].reverse()) {
+        if (m && m.role === "assistant" && m.model) return m.model;
+    }
+    return null;
+}
+
+async function saveCurrentToHistory() {
     const msgs = window.messages || [];
 	console.log("[PHOENIX-DEBUG] saveCurrentToHistory CALLED, msgs.length=", msgs.length, "stack=", new Error().stack);
     if (!msgs.length) return null;
@@ -446,11 +666,9 @@ function saveCurrentToHistory() {
         id: `${now}-${Math.random().toString(36).slice(2, 8)}`,
         number,
         title: `Чат ${String(number).padStart(4, "0")}`,
-        model: window.__lastResponseModel
-			|| (window.Providers.getProvider(store.get("provider", "strata")).id === "strata"
-				  ? (window.lastMetrics?.engine?.model || window.health?.model)
-				  : store.get("model_id", ""))
-			|| "unknown",
+        // Модель чата — только та, которую сервер сообщил в ответе. Если ни один
+        // ответ её не сообщил, остаётся null: запрошенную модель не подставляем.
+        model: lastReportedModel(),
         pinned: false,
 		created: msgs[0].time || now,
         updated: msgs[msgs.length - 1].time || now,
@@ -462,27 +680,28 @@ function saveCurrentToHistory() {
         source_content_hash: null,
         source_content_hash_version: null
     };
-    addNewChat(chat);
+    // addNewChat сам обновляет локальный список синхронно, а POST дожидается
+    // внутри — поэтому currentHistoryId ставим сразу, до await.
+    const saved = addNewChat(chat);
     setCurrentHistoryId(chat.id);
 	console.log("[PHOENIX-DEBUG] CREATED chat id=", chat.id, "number=", number);
+    await saved;
     return chat.id;
 }
 
-function syncCurrentHistory() {
+async function syncCurrentHistory() {
     if (isSwitchingChat) return; // Не сохраняем, если мы просто открываем чат
 	const msgs = window.messages || [];
 	console.log("[SYNC-DEBUG] msgs.length=", msgs.length, "currentHistoryId=", currentHistoryId);
     if (!msgs.length) return;
     const now = Date.now();
     if (!currentHistoryId) {
-        saveCurrentToHistory();
-        return;
+        return saveCurrentToHistory();
     }
     const chat = localHistory.find((h) => h.id === currentHistoryId);
     if (!chat) {
         setCurrentHistoryId(null);
-        saveCurrentToHistory();
-        return;
+        return saveCurrentToHistory();
     }
     const lastTimeRaw = msgs[msgs.length - 1].time;
 	let lastTime;
@@ -500,13 +719,13 @@ function syncCurrentHistory() {
 
     // Обновляем модель только для нативных чатов, импортам не трогаем исторические данные
 	if (chat.source === "native" || !chat.source) {
-        chat.model = window.__lastResponseModel 
-              || window.health?.model 
-              || window.lastMetrics?.engine?.model
-              || "unknown";
+        const reported = lastReportedModel();
+        if (reported) chat.model = reported;                  // сервер сообщил модель в ответе
+        else if (chat.model === undefined || chat.model === "unknown") chat.model = null;
+        // если модель уже записана, а текущий ответ её не сообщил — нетираем старые данные
     }
 
-    saveHistoryChat(chat);
+    return saveHistoryChat(chat);
 }
 
 // ===== History Drawer UI ===========================================
@@ -516,7 +735,14 @@ function openHistory(open) {
     }
     $("history-drawer").dataset.open = String(open);
     $("history-drawer").setAttribute("aria-hidden", String(!open));
-    $("scrim").hidden = !open;
+    // Затемнение фона (#scrim) нужно только режиму наложения (< 1000px).
+    // При широком окне панель стоит в потоке и чат не перекрывает — затемнение мешало кликам.
+    const scrim = $("scrim");
+    if (scrim) {
+        const overlay = window.matchMedia("(max-width: 1000px)").matches;
+        scrim.dataset.historyOpen = String(open);
+        scrim.hidden = !(open && overlay);
+    }
     if (open) renderHistory();
 }
 
@@ -567,17 +793,11 @@ function renderHistory() {
         return;
     }
     
-    // "Эффективная" дата: для свежих импортов (в пределах 24 часов) — imported_at,
-    // иначе — updated или created. Это поднимает импорты наверх и группирует в "Сегодня".
+    // Stage 16.1: порядок ленты и метки дней считаются по одному ключу — chatSortTime.
+    // Правило «свежего импорта» осталось только для бейджа NEW.
     const now = Date.now();
     const NEW_WINDOW = 24 * 60 * 60 * 1000; // 24 часа
-    const effectiveTime = (chat) => {
-        const imp = chat.imported_at || 0;
-        const upd = chat.updated || chat.created || 0;
-        // если импорт свежий — показываем наверху
-        if (imp && (now - imp) < NEW_WINDOW) return Math.max(imp, upd);
-        return upd;
-    };
+    const effectiveTime = (chat) => chatSortTime(chat, historyFilters.sortMode);
     const isNewImport = (chat) => {
         const imp = chat.imported_at || 0;
         return imp && (now - imp) < NEW_WINDOW;
@@ -612,7 +832,9 @@ function renderHistory() {
             <div class="history-group__items">
                 ${group.chats.map((chat) => {
                     const isCurrent = chat.id === currentHistoryId;
-                    const created = chat.created || Date.now();
+                    // дата в карточке = сортировочный ключ, чтобы метка строки
+                    // не противоречила метке дня группы
+                    const created = effectiveTime(chat) || chat.created || Date.now();
                     const newBadge = isNewImport(chat)
                         ? `<span class="st-badge st-badge--reading" style="margin-left:6px;font-size:0.7em;padding:1px 5px;" title="Imported less than 24h ago">NEW</span>`
                         : "";
@@ -634,7 +856,7 @@ function renderHistory() {
                             <button type="button" class="history-item__open"
                                     data-history-open="${esc(chat.id)}">
                                 <div class="history-item__title">
-                                    <span class="history-item__title-text">${esc(chat.title)}</span>${newBadge}
+                                    <span class="history-item__title-text" title="${esc(chat.title)}">${esc(chat.title)}</span>${newBadge}
                                 </div>
                                 <div class="history-item__meta">
                                     ${chat.message_count || 0} msgs · ${historyTimeLabel(created)} · ${historyCreatedDateLabel(created)}
@@ -666,6 +888,8 @@ function renderHistory() {
         more.onclick = async () => {
             more.disabled = true;
             more.textContent = "Loading…";
+            // догрузка порции: рендер не должен менять позицию прокрутки
+            historyPreserveScroll = true;
             await loadHistoryFromServer(historyFilters.loadedPage + 1, true);
         };
         list.appendChild(more);
@@ -678,12 +902,18 @@ function renderHistory() {
     }    
     updateActiveChatHeader();
 	// Скроллим к текущему чату, если он есть в списке
-    if (currentHistoryId) {
+    // Позиция прокрутки до перерисовки — нужна, чтобы «Load more» её сохранил
+    const keepScroll = historyPreserveScroll
+        ? (() => { const b = list.closest(".st-drawer__body"); return b ? { b, top: b.scrollTop } : null; })()
+        : null;
+    historyPreserveScroll = false;
+    if (currentHistoryId && !keepScroll) {
         setTimeout(() => {
             const el = document.querySelector(`[data-history-id="${CSS.escape(currentHistoryId)}"]`);
             if (el) el.scrollIntoView({ block: "center" });
         }, 10);
     }
+    if (keepScroll) keepScroll.b.scrollTop = keepScroll.top;
 }
 
 // ===== Full-text search UI =========================================
@@ -736,7 +966,9 @@ function renderSearchResults(payload) {
                     const local = getChatById(r.id);
                     const title = (local && local.title) || r.title || r.id;
                     const source = (local && local.source) || r.source;
-                    const updatedMs = r.updated_at ? new Date(r.updated_at).getTime() : 0;
+                    const updatedMs = historyFilters.sortMode === "discussion"
+                        ? (toTimeValue(r.source_updated_at) ?? toTimeValue(r.created_at) ?? 0)
+                        : (r.updated_at ? new Date(r.updated_at).getTime() : 0);
                     const dateStr = updatedMs ? historyCreatedDateLabel(updatedMs) : "";
                     
                     const isSmart = r.match_in === "card" || r.match_in === "tag";
@@ -767,7 +999,7 @@ function renderSearchResults(payload) {
                                     data-history-open="${esc(r.id)}"
                                     data-msg-index="${Number.isInteger(r.msg_index) ? r.msg_index : -1}">
                                 <div class="history-item__title">
-                                    <span class="history-item__title-text">${esc(title)}</span>
+                                    <span class="history-item__title-text" title="${esc(title)}">${esc(title)}</span>
                                     ${isSmartMode ? '<span class="st-badge" style="margin-left:6px;font-size:0.7em;background:#8b5cf6;color:#fff;">AI</span>' : ''}
                                 </div>
                                 <div class="history-item__meta">
@@ -817,7 +1049,7 @@ async function runSearchNow() {
     try {
         const mode = document.getElementById("history-search-mode")?.value || "strict";
         const pinnedParam = historyFilters.pinnedOnly ? "&pinned_only=true" : "";
-        const url = `${SERVER}/search?q=${encodeURIComponent(q)}&mode=${mode}${pinnedParam}`;
+        const url = `${SERVER}/search?q=${encodeURIComponent(q)}&mode=${mode}${pinnedParam}&sort_mode=${historyFilters.sortMode}`;
         
         const r = await fetch(url, {signal: searchAbort.signal});
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -992,12 +1224,17 @@ async function loadHistoryChat(id) {
         if (window.setBusy) window.setBusy(false);
     }
 
+    // 2. Save current chat before switching. syncCurrentHistory() — ДО флага:
+    //    guard в начале функции выходит при isSwitchingChat === true, и иначе
+    //    этот пред-сейв не выполнялся бы (порядок как в New Chat, строка 56).
+    //    await — чтобы POST старого чата завершился до загрузки нового чата.
+    await syncCurrentHistory();
+
     // === СТАВИМ ФЛАГ ЗАГРУЗКИ (чтобы syncCurrentHistory не спамил сохранениями) ===
     isSwitchingChat = true;
     
     try {
-        // 2. Save current chat before switching
-        syncCurrentHistory();
+        // (пред-сейв выполнен выше — до установки isSwitchingChat)
 
         // 3. Lazy-load full messages from server if not in memory
         if (!chat.messages) {
@@ -1304,6 +1541,7 @@ async function initHistory() {
     injectTrashButton();
     restoreHistoryFilters();
     injectTrashButton();
+    loadSavedFilters();
 	renderHistory();
     const btn = document.getElementById("history-btn");
     if (btn) {
@@ -1314,9 +1552,32 @@ async function initHistory() {
     }
     const closeBtn = document.getElementById("history-drawer-close");
     if (closeBtn) closeBtn.onclick = () => openHistory(false);
+    // Узкое окно (<1000px): панель — наложение. Способ закрытия: клик по затемнению, Escape, кнопка в шапке.
+    const scrimEl = document.getElementById("scrim");
+    if (scrimEl && scrimEl.dataset.historyBound !== "1") {
+        scrimEl.dataset.historyBound = "1";
+        scrimEl.addEventListener("click", () => {
+            if (scrimEl.dataset.historyOpen === "true") openHistory(false);
+        });
+    }
+    const mqOverlay = window.matchMedia("(max-width: 1000px)");
+    const onOverlayChange = () => {
+        const drawer = document.getElementById("history-drawer");
+        if (drawer && drawer.dataset.open === "true") openHistory(true);
+    };
+    if (mqOverlay.addEventListener) mqOverlay.addEventListener("change", onOverlayChange);
+    else if (mqOverlay.addListener) mqOverlay.addListener(onOverlayChange);
+    document.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape") return;
+        const drawer = document.getElementById("history-drawer");
+        if (!drawer || drawer.dataset.open !== "true") return;
+        if (e.target && e.target.id === "history-search") return; // поле поиска сам обрабатывает Escape
+        openHistory(false);
+    });
     const searchInput = document.getElementById("history-search");
     if (searchInput) {
         searchInput.addEventListener("input", scheduleSearch);
+        searchInput.addEventListener("input", renderSavedFilters); // подсветка активного сохранённого фильтра
         searchInput.addEventListener("keydown", (e) => {
             if (e.key === "Escape") {
                 if (searchInput.value) { searchInput.value = ""; runSearchNow(); }

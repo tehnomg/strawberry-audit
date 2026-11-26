@@ -75,6 +75,11 @@ main { flex: 1; min-height: 0; display: flex; }
         background: var(--st-surface-2); border: 1px solid var(--st-line); font-size: var(--st-fs-xs); color: var(--st-ink-soft); }
 .chip .st-btn--icon { width: 22px; height: 22px; border-radius: 50%; }
 .chip .st-btn--icon .st-icon { width: 14px; height: 14px; }
+/* чип-ссылка: вложение, которое реально лежит в хранилище */
+a.chip { text-decoration: none; cursor: pointer; }
+a.chip:hover { border-color: var(--st-accent); color: var(--st-ink); background: var(--st-accent-tint); }
+a.chip .chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 32ch; }
+.msg-images__img { display: inline-flex; }
 
 /* ---------------------------------------------------------------- monitor */
 .view--monitor, .view--about { overflow-y: auto; }
@@ -190,7 +195,7 @@ main { flex: 1; min-height: 0; display: flex; }
 
 .history-group__title {
   padding: 4px 8px 7px;
-  color: var(--text-muted, #888);
+  color: var(--st-ink-muted, #6f6f6f);
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -248,8 +253,9 @@ main { flex: 1; min-height: 0; display: flex; }
 
 
 
-.history-item__open:hover {
-  background: rgba(255, 255, 255, 0.05);
+.history-item__open:hover,
+.history-item__open:focus-visible {
+  background: var(--st-surface-2, rgba(255, 255, 255, 0.05));
 }
 
 .history-item__title {
@@ -273,7 +279,7 @@ main { flex: 1; min-height: 0; display: flex; }
 
 .history-item__meta {
   margin-top: 3px;
-  color: var(--text-muted, #888);
+  color: var(--st-ink-muted, #6f6f6f);
   font-size: 11px;
 }
 
@@ -285,7 +291,7 @@ main { flex: 1; min-height: 0; display: flex; }
   padding: 0;
   border: 0;
   background: transparent;
-  color: var(--text-muted, #888);
+  color: var(--st-ink-muted, #6f6f6f);
   font-size: 16px;
   line-height: 1;
   cursor: pointer;
@@ -299,8 +305,23 @@ main { flex: 1; min-height: 0; display: flex; }
   opacity: 1;
 }
 
-.history-item__menu:hover {
-  background: rgba(255, 255, 255, 0.05);
+/* Устройства без наведения (тач): кнопка меню видна всегда, полупрозрачно */
+@media (hover: none) {
+  .history-item__menu {
+    opacity: 0.55;
+  }
+}
+
+/* Клавиатурная навигация: кнопка появляется и получает видимый фокус */
+.history-item__menu:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--st-focus, #405de6);
+  outline-offset: -2px;
+}
+
+.history-item__menu:hover,
+.history-item__menu:focus-visible {
+  background: var(--st-surface-2, rgba(255, 255, 255, 0.05));
 }
 
 .history-item__popup {
@@ -310,10 +331,11 @@ main { flex: 1; min-height: 0; display: flex; }
   right: 4px;
   min-width: 150px;
   padding: 4px;
-  border: 1px solid var(--border, rgba(255, 255, 255, 0.10));
+  border: 1px solid var(--st-line, rgba(255, 255, 255, 0.10));
   border-radius: 8px;
-  background: var(--surface, #222);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  background: var(--st-surface, #222);
+  color: var(--st-ink-soft, inherit);
+  box-shadow: var(--st-sh-pop, 0 8px 24px rgba(0, 0, 0, 0.35));
   pointer-events: auto;
 }
 
@@ -339,8 +361,9 @@ main { flex: 1; min-height: 0; display: flex; }
   cursor: pointer;
 }
 
-.history-item__popup button:hover {
-  background: rgba(255, 255, 255, 0.07);
+.history-item__popup button:hover,
+.history-item__popup button:focus-visible {
+  background: var(--st-surface-2, rgba(255, 255, 255, 0.07));
 }
 
 .history-item:has(.history-item__popup:not([hidden])) {
@@ -359,30 +382,49 @@ main { flex: 1; min-height: 0; display: flex; }
   min-width: 0;
 }
 
-/* Override .st-drawer's fixed overlay for the history drawer only */
-#history-drawer {
-  position: static !important;
-  top: auto;
-  right: auto;
-  height: auto;
-  width: 0;
-  min-width: 0;
-  max-width: 0;
-  transform: none !important;
-  overflow: hidden;
-  flex-shrink: 0;
-  z-index: auto;
-  box-shadow: none;
-  border-left: none;
-  display: flex;              /* ← добавить */
-  flex-direction: column;     /* ← добавить */
-  transition: width 220ms var(--st-ease), min-width 220ms var(--st-ease), max-width 220ms var(--st-ease);
+/* Override .st-drawer's fixed overlay for the history drawer only.
+   Только для широких окон (>1000px): панель в потоке, теснит чат.
+   Ниже 1000px действуют базовые правила .st-drawer из components.css:
+   фиксированное наложение справа + затемнение фона (#scrim) + кнопка закрытия в шапке. */
+@media (min-width: 1001px) {
+  #history-drawer {
+    position: static !important;
+    top: auto;
+    right: auto;
+    height: auto;
+    width: 0;
+    min-width: 0;
+    max-width: 0;
+    transform: none !important;
+    overflow: hidden;
+    flex-shrink: 0;
+    z-index: auto;
+    box-shadow: none;
+    border-left: none;
+    display: flex;              /* ← добавить */
+    flex-direction: column;     /* ← добавить */
+    transition: width 220ms var(--st-ease), min-width 220ms var(--st-ease), max-width 220ms var(--st-ease);
+  }
+  #history-drawer[data-open="true"] {
+    width: 340px;
+    min-width: 340px;
+    max-width: 340px;
+    border-left: 1px solid var(--st-line);
+  }
 }
-#history-drawer[data-open="true"] {
-  width: 340px;
-  min-width: 340px;
-  max-width: 340px;
-  border-left: 1px solid var(--st-line);
+
+/* Узкие окна: панель поверх чата; на very narrow — почти во всю ширину */
+@media (max-width: 1000px) {
+  #history-drawer {
+    width: min(360px, 100vw);
+    max-width: 100vw;
+  }
+  #history-drawer[data-open="true"] {
+    transform: none !important;
+  }
+}
+@media (max-width: 420px) {
+  #history-drawer { width: 92vw; }
 }
 
 /* --- Наши правки --- */
@@ -456,3 +498,6 @@ html[data-theme="light"] .st-msg--assistant .st-bubble {
     line-height: 1.5 !important;
     color: var(--st-ink, #fff) !important; 
 }
+
+/* Тосты поверх всех слоёв: окно профиля z-index 1000, оверлеи генерации до 99999 */
+.st-toasts { z-index: 100000; }
